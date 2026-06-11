@@ -4,6 +4,9 @@
 
 `sattime` is a high-performance, Rust-based Software Defined Radio (SDR) carrier-tracking receiver and atomic-disciplined time server daemon. Designed for Low Earth Orbit (LEO) satellite constellations (e.g., Starlink, NOAA, Orbcomm, Iridium), the system uses passive Doppler oscillometry to achieve decimeter-level relative positioning and microsecond-level local system clock synchronization—completely offline, without requiring a commercial internet connection.
 
+> [!NOTE]
+> **Real-World Testing & Hardware Setup**: During active development and live testing, the system consistently achieved signal locks and converged geodetic solutions using a highly accessible, indoor hardware setup: a simple **metal whip antenna magnetically mounted to a cookie sheet** (acting as a ground plane) sitting **inside a basement**, connected to a **HackRF One** SDR. This highlights the robustness of the 3-state carrier PLL-EKF and symbol tracking algorithms under heavily obstructed, non-ideal signal conditions.
+
 ---
 
 ## Key Components
