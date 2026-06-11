@@ -111,8 +111,8 @@ To track weak, high-acceleration Doppler carrier leakage under extreme noise ($S
   where $\Delta t = 1 / f_{decimated}$ is the decimated sample interval.
 - **State Propagation (Predict)**:
   $$x_k^- = F x_{k-1}^+ = \begin{bmatrix} \theta_{k-1} + \omega_{k-1} \Delta t + \frac{1}{2} \alpha_{k-1} \Delta t^2 \\ \omega_{k-1} + \alpha_{k-1} \Delta t \\ \alpha_{k-1} \end{bmatrix}$$
-  The phase state $\theta_k^-$ is wrapped to the range $[-\pi, \pi)$ using the Euclidean remainder:
-  $$\theta_k^- \leftarrow \text{rem\_euclid}(\theta_k^- + \pi, 2\pi) - \pi$$
+  The phase state $\theta_k^-$ is wrapped to the range $[-H_L, H_L)$ (where $H_L = \pi$ for Carrier, $H_L = \pi/2$ for BPSK, and $H_L = \pi/4$ for QPSK) using the Euclidean remainder:
+  $$\theta_k^- \leftarrow \text{rem\_euclid}(\theta_k^- + H_L, 2 \cdot H_L) - H_L$$
 - **Covariance Propagation**:
   $$P_k^- = F P_{k-1}^+ F^T + Q$$
   where $Q$ is the diagonal process noise covariance matrix representing model uncertainty:
@@ -123,8 +123,14 @@ To track weak, high-acceleration Doppler carrier leakage under extreme noise ($S
 - **Linearized Phase-Error Measurement Update**:
   Let $y_k$ be the complex decimated sample. To avoid a non-linear observation model, $y_k$ is first derotated by the predicted phase $\theta_k^-$:
   $$y'_k = y_k \cdot e^{-j \theta_k^-}$$
-  The phase innovation $z_k$ is the four-quadrant arctangent of the derotated sample:
-  $$z_k = \text{atan2}(\text{Im}(y'_k), \text{Re}(y'_k))$$
+  The phase innovation $z_k$ is calculated based on the modulation type:
+  - **Carrier**:
+    $$z_k = \text{atan2}(\text{Im}(y'_k), \text{Re}(y'_k))$$
+  - **BPSK**:
+    $$z_k = 0.5 \cdot \text{atan2}\left(2 \cdot \text{Re}(y'_k) \text{Im}(y'_k), \, \text{Re}(y'_k)^2 - \text{Im}(y'_k)^2\right)$$
+  - **QPSK**:
+    Let $I_2 = \text{Re}(y'_k)^2 - \text{Im}(y'_k)^2$ and $Q_2 = 2 \cdot \text{Re}(y'_k) \text{Im}(y'_k)$.
+    $$z_k = 0.25 \cdot \text{atan2}\left(2 \cdot I_2 Q_2, \, I_2^2 - Q_2^2\right)$$
   The observation row vector is completely linear:
   $$H = \begin{bmatrix} 1 & 0 & 0 \end{bmatrix}$$
   The innovation covariance is:
@@ -192,12 +198,20 @@ The Automatic Gain Control (AGC) loop executes every 2,000,000 raw samples ($\ap
     $$V_{RMS} = \sqrt{\frac{1}{N_{total}} \sum_{n=1}^{N_{total}} \|x[n]\|_2^2}$$
 
 - **Feedback Rules**:
-  - **Saturation state**: If $R_{clip} > 0.005$ ($0.5\%$ clipping rate):
-    - Reduce LNA gain by $8.0\text{ dB}$ (lower limit $0.0\text{ dB}$).
-    - If LNA is already at $0\text{ dB}$, reduce VGA gain by $4.0\text{ dB}$ (lower limit $0.0\text{ dB}$).
+  - **Saturation state**: If $R_{clip} > 0.005$ ($0.5\%$ clipping rate) or $V_{RMS} > 0.5$:
+    - If $g_{AMP} > 0.0$:
+      $$g_{AMP} \leftarrow 0.0$$
+    - Else if $g_{VGA} > 0.0$:
+      $$g_{VGA} \leftarrow \max(0.0, g_{VGA} - 2.0)$$
+    - Else if $g_{LNA} > 0.0$:
+      $$g_{LNA} \leftarrow \max(0.0, g_{LNA} - 8.0)$$
   - **Weak signal state**: If $V_{RMS} < 0.05$:
-    - Increase LNA gain by $8.0\text{ dB}$ (upper limit $40.0\text{ dB}$).
-    - If LNA is already at $40\text{ dB}$, increase VGA gain by $4.0\text{ dB}$ (upper limit $62.0\text{ dB}$).
+    - If $g_{LNA} < 40.0$:
+      $$g_{LNA} \leftarrow \min(40.0, g_{LNA} + 8.0)$$
+    - Else if $g_{VGA} < 62.0$:
+      $$g_{VGA} \leftarrow \min(62.0, g_{VGA} + 2.0)$$
+    - Else if $g_{AMP} < 14.0$:
+      $$g_{AMP} \leftarrow 14.0$$
 
 ---
 
@@ -344,37 +358,28 @@ The EKF filters local oscillator phase and frequency errors.
   $$P_{11} \leftarrow P_{11} + q_{freq} dt$$
   where $\tau = dt \cdot 10^{-6}$.
 - **Measurement Update**:
-  The measurement is the phase offset $z = \text{offset\_seconds}$ (derived from Doppler shift PCA curve fitting).
-  - Observation matrix: $H = \begin{bmatrix} 1 & 0 \end{bmatrix}$
-  - Measurement residual: $y = z - H x_{pred} = \text{offset\_seconds} - x_0$
-  - Innovation covariance: $S = H P_{pred} H^T + R = P_{00} + r_{meas}$, where $r_{meas} = 10^{-8}\text{ s}^2$ is the measurement noise variance.
-  - Kalman Gain:
-    $$K = \begin{bmatrix} k_0 \\ k_1 \end{bmatrix} = P_{pred} H^T S^{-1} = \begin{bmatrix} P_{00} / S \\ P_{10} / S \end{bmatrix}$$
+  The measurement vector $z$ consists of the phase offset and frequency drift:
+  $$z = \begin{bmatrix} \text{offset\_seconds} \\ \text{frequency\_drift\_ppm} \end{bmatrix}$$
+  - Observation matrix (Identity): $H = \begin{bmatrix} 1 & 0 \\ 0 & 1 \end{bmatrix}$
+  - Measurement residual: $y = z - H x_{pred} = \begin{bmatrix} \text{offset\_seconds} - x_0 \\ \text{frequency\_drift\_ppm} - x_1 \end{bmatrix}$
+  - Measurement noise covariance matrix: $R = \begin{bmatrix} r_{meas} & 0 \\ 0 & r_{freq} \end{bmatrix}$, where $r_{meas} = 10^{-8}\text{ s}^2$ and $r_{freq} = 10^{-4}\text{ PPM}^2$.
+  - Innovation covariance: $S = H P_{pred} H^T + R = P_{pred} + R$
+  - Kalman Gain matrix:
+    $$K = P_{pred} H^T S^{-1} = P_{pred} S^{-1}$$
   - Post-measurement state update:
-    $$x_{post} = x_{pred} + K y = \begin{bmatrix} x_0 + k_0 y \\ x_1 + k_1 y \end{bmatrix}$$
+    $$x_{post} = x_{pred} + K y$$
 
 ### 4.2 Joseph Form Covariance Update Formulation
 To guarantee numerical stability, prevent negative variance values, and maintain covariance symmetry in finite-precision floating-point arithmetic, the EKF updates the covariance matrix $P$ using the Joseph Form:
 $$P_{post} = (I - KH) P_{pred} (I - KH)^T + K R K^T$$
-- Let $A = I - KH$:
-  $$A = \begin{bmatrix} 1 & 0 \\ 0 & 1 \end{bmatrix} - \begin{bmatrix} k_0 \\ k_1 \end{bmatrix} \begin{bmatrix} 1 & 0 \end{bmatrix} = \begin{bmatrix} 1 - k_0 & 0 \\ -k_1 & 1 \end{bmatrix}$$
-- The intermediate matrix multiplication $AP = (I-KH)P_{pred}$ is:
-  $$AP = \begin{bmatrix} a_{00} P_{00} & a_{00} P_{01} \\ a_{10} P_{00} + P_{10} & a_{10} P_{01} + P_{11} \end{bmatrix}$$
-  where $a_{00} = 1.0 - k_0$ and $a_{10} = -k_1$.
-- The updated covariance matrix components are:
-  $$P_{post, 00} = AP_{00} \cdot (1 - k_0) + k_0^2 \cdot r_{meas}$$
-  $$P_{post, 01} = -AP_{00} \cdot k_1 + AP_{01} + k_0 k_1 \cdot r_{meas}$$
-  $$P_{post, 10} = P_{post, 01}$$
-  $$P_{post, 11} = -AP_{10} \cdot k_1 + AP_{11} + k_1^2 \cdot r_{meas}$$
+Since $H = I$, this simplifies to:
+$$P_{post} = (I - K) P_{pred} (I - K)^T + K R K^T$$
+Letting $A = I - K$, the covariance update is implemented in `src/ekf.rs` as:
+$$P_{post} = A P_{pred} A^T + K R K^T$$
 
 ### 4.3 Control Feedback and Clock Discipline
-- **Proportional-Integral (PI) Accumulator**:
-  In parallel with the EKF, a PI loop tracks cumulative offset drift:
-  $$\text{integral\_error} \leftarrow \text{integral\_error} + \text{offset\_seconds} \cdot dt$$
-  $$\text{target\_adjustment} = k_p \cdot \text{offset\_seconds} + k_i \cdot \text{integral\_error}$$
-  where $k_p = 0.1$ and $k_i = 0.01$.
 - **Clock Discipline (`steer_system_clock`)**:
-  - Unix Systems: The EKF-filtered phase offset estimate $x_0$ is sent to the operating system kernel via `libc::adjtime` to slew the clock:
+  - Unix Systems: The EKF-filtered phase offset estimate $x_0$ (which is $x[0]$ of the Clock EKF, representing `target_adjustment`) is sent to the operating system kernel via `libc::adjtime` to slew the clock:
     ```rust
     let sec = target_adjustment.trunc() as libc::time_t;
     let usec = ((target_adjustment.fract() * 1_000_000.0) as i32) as libc::suseconds_t;
@@ -472,21 +477,21 @@ In `orbit_solver.rs`, this is implemented as `inverse_monna_map(x: f64, p: u64, 
 #### 3. $p$-adic Distance Metric
 The $p$-adic distance $d_p(a, b)$ between two integers $a, b \in \mathbb{Z}$ is defined as:
 $$d_p(a, b) = p^{-v_p(|a - b|)}$$
-where $v_p(x)$ is the $p$-adic valuation of $x$, representing the exponent of the highest power of $p$ that divides $x$. In `orbit_solver.rs`, this is implemented as `p_adic_distance(a: i64, b: i64, p: u64) -> f64`.
+where $v_p(x)$ is the $p$-adic valuation of $x$, representing the exponent of the highest power of $p$ that divides $x$. In `orbit_solver.rs`, this is implemented as `p_adic_distance(a: u64, b: u64, p: u64) -> f64`.
 
 #### 4. Discrete Fractional Difference History
 The $p$-adic discrete fractional derivative $\mathcal{D}^\alpha_p x_i$ of order $\alpha = 0.5$ on a history of points $x$ over the field of 2-adic numbers $\mathbb{Q}_2$ is formulated as:
 $$\mathcal{D}^{0.5}_2 x_i = \sum_{j \neq i} \frac{x_i - x_j}{d_2(i, j)^{1.5}}$$
 where the denominator exponent $1.5$ corresponds to $1 + \alpha$. In `orbit_solver.rs`, this is implemented as:
 ```rust
-pub fn compute_fractional_difference_history(history: &[f64]) -> Vec<f64>
+pub fn compute_fractional_difference_history(x: &[f64]) -> Vec<f64>
 ```
 which evaluates this discrete difference over the last $N$ states using $p = 2$.
 
 #### 5. Search Space Coordinate Projection
 To perform global search, continuous coordinates (including WGS84 ECEF coordinates converted via Bowring's method) are mapped to a normalized 15-dimensional search space $I^{15} \subset [0, 1)^{15}$ using base-$p$ digit reversals for 4 distinct primes $p \in \{2, 3, 5, 7\}$. This mapping is handled in `orbit_solver.rs` by:
 ```rust
-pub fn map_to_normalized_search_space(ecef: [f64; 3]) -> Vec<f64>
+pub fn map_to_normalized_search_space(coord: [f64; 3]) -> Vec<f64>
 ```
 
 #### 6. Stochastic Langevin Update Equation
@@ -550,7 +555,7 @@ pub fn compute_tracker_discrepancy(&self) -> f32
 If the discrepancy exceeds the pruning threshold of $150.0\text{ Hz}$ ($D > 150.0$), the system identifies a cohomological obstruction.
 
 #### 4. Consensus Pruning and Steering Suspension
-When $D > 150.0\text{ Hz}$, the following actions are executed in `main.rs`:
+When $D > 150.0\text{ Hz}$, the following actions are executed in `dsp.rs`:
 - NTP clock steering is suspended by setting:
   $$\text{terminated\_in\_fade} \leftarrow \text{true}$$
 - Rogue trackers deviating by $> 150.0\text{ Hz}$ are pruned:

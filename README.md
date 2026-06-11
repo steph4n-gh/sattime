@@ -2,7 +2,7 @@
 
 ![sattime TUI Screenshot](docs/sattime_screenshot.jpg)
 
-`sattime` is a high-performance, Rust-based Software Defined Radio (SDR) carrier-tracking receiver and atomic-disciplined time server daemon. Designed for Low Earth Orbit (LEO) satellite constellations (e.g., Starlink, NOAA, Orbcomm, Iridium), the system uses passive Doppler oscillometry to achieve decimeter-level relative positioning and microsecond-level local system clock synchronization—completely offline, without requiring a commercial internet connection.
+`sattime` is a high-performance, Rust-based Software Defined Radio (SDR) carrier-tracking receiver and satellite-disciplined time server daemon. Designed for Low Earth Orbit (LEO) satellite constellations (e.g., Starlink, NOAA, Orbcomm, Iridium), the system uses passive Doppler oscillometry to achieve relative positioning and microsecond-level local system clock synchronization—completely offline, without requiring a commercial internet connection.
 
 > [!NOTE]
 > **Real-World Testing & Hardware Setup**: During active development and live testing, the system consistently achieved signal locks and converged geodetic solutions using a highly accessible, indoor hardware setup: a simple **metal whip antenna magnetically mounted to a cookie sheet** (acting as a ground plane) sitting **inside a basement**, connected to a **HackRF One** SDR. This highlights the robustness of the 3-state carrier PLL-EKF and symbol tracking algorithms under heavily obstructed, non-ideal signal conditions.
@@ -33,7 +33,40 @@
 
 ### Hardware Requirements
 - **SDR Receiver**: RTL-SDR, HackRF, LimeSDR, Airspy, or any other receiver supported by SoapySDR.
-- **Antenna**: A VHF/UHF antenna suitable for LEO reception (e.g., a simple dipole, turnstile, QFH, or eggbeater antenna tuned to the satellite frequencies).
+- **Antenna**: A VHF/UHF antenna suitable for LEO reception. See the summary table below and the dedicated [Antenna Design & Tuning Guide](docs/antenna_tuning_guide.md) for detailed construction diagrams and physical calculations.
+
+---
+
+## Antenna Tuning Guide
+
+For detailed construction diagrams, velocity factor calculations, turnstile phase delay lines, common-mode choke baluns, and NanoVNA verification methods, see the dedicated [Antenna Design & Tuning Guide](docs/antenna_tuning_guide.md).
+
+LEO satellites transmit signals with specific polarizations (typically Right-Hand Circular Polarization, RHCP) and operate on different frequency bands. To achieve optimal signal locks, your antenna elements must be tuned (cut) to the correct wavelength ($\lambda$) for each satellite swarm:
+
+| Satellite Swarm | Downlink Frequency | Wavelength ($\lambda$) | Recommended Antenna Type | Quarter-Wave Element Length ($\lambda / 4$) |
+| :--- | :--- | :--- | :--- | :--- |
+| **NOAA Weather** | $137.1\text{–}137.9\text{ MHz}$ | $\approx 2.19\text{ m}$ | QFH or V-Dipole | $52.0\text{ cm}$ (per dipole leg) |
+| **Orbcomm M2M** | $137.5\text{ MHz}$ | $\approx 2.18\text{ m}$ | QFH or Turnstile | $51.8\text{ cm}$ (per element) |
+| **Amateur Satellites** | $145.8\text{–}146.0\text{ MHz}$ | $\approx 2.05\text{ m}$ | Eggbeater or Yagi | $49.0\text{ cm}$ (per element) |
+| **Starlink VHF** | $150.8\text{ MHz}$ | $\approx 1.99\text{ m}$ | Whip on Ground Plane | $49.7\text{ cm}$ (whip length) |
+| **Iridium L-Band** | $1621.0\text{–}1626.5\text{ MHz}$| $\approx 18.4\text{ cm}$ | Active L-Band Patch | $4.6\text{ cm}$ (patch/helix element) |
+
+### Swarm-Specific Tuning Details
+
+#### 1. NOAA & Orbcomm (137 MHz band)
+*   **The V-Dipole**: For a quick, zero-cost build, construct a V-dipole using two $52\text{ cm}$ copper wire legs. Mount them horizontally at a $120^\circ$ angle, oriented North-South.
+*   **The QFH (Quadrifilar Helix)**: The gold standard for omnidirectional weather satellite reception. It uses circularly polarized loops to eliminate signal fading as the satellite spins.
+
+#### 2. Amateur Satellites (145.8 MHz VHF)
+*   **The Eggbeater**: A compact, omnidirectional RHCP antenna that has high gain straight up, making it excellent for overhead passes without requiring a rotator.
+*   **Directional Yagi**: A 3-element or 5-element handheld Yagi-Uda gives the best gain but requires manual tracking (pointing it at the satellite).
+
+#### 3. Starlink VHF (150.8 MHz)
+*   **The Whip on a Ground Plane**: Starlink transmitters use vertical polarization. A simple $49.7\text{ cm}$ metal whip antenna magnetically mounted to a metal sheet (like a steel cookie sheet, filing cabinet, or car roof) acts as a highly effective ground plane. 
+*   **Indoor/Basement Setup**: While line-of-sight is ideal, Starlink VHF signals are strong enough that a vertical whip stuck to a cookie sheet sitting inside a basement can still capture decodable Doppler curves.
+
+#### 4. Iridium L-Band (1626 MHz)
+*   **Active L-Band Patch**: Because L-band signals attenuate quickly in the atmosphere and do not penetrate buildings, you must use a dedicated L-band patch antenna with a built-in low-noise amplifier (LNA) placed outdoors with a clear view of the sky. Passive whip antennas will not work on this band.
 
 ---
 

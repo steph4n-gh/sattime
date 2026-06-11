@@ -1,6 +1,6 @@
 # Keeping Time with the Cosmos: A Home-Built Satellite Time Tracker
 
-Welcome, curious explorer and supportive parents! If you have ever wondered how the clocks on our computers, phones, and global financial networks stay in perfect harmony, you are in the right place. Today, we are going to embark on an exciting journey to build our very own satellite-guided time tracker. 
+Welcome, curious explorer and supportive parents! If you have ever wondered how the clocks on our computers, phones, and global financial networks stay synchronized, you are in the right place. Today, we are going to embark on an exciting journey to build our very own satellite-guided time tracker. 
 
 We will explore how we can listen to signals from satellites flying hundreds of miles above our heads and use them to steer our local computer clock. Best of all, we will break down the complex science into simple ideas that anyone can understand. No advanced math degrees required—just a bit of curiosity and a desire to see how the pieces of physics and software fit together.
 
@@ -12,7 +12,7 @@ Let us start with a simple question: how does your computer know what time it is
 
 Inside every computer, smartphone, and digital wristwatch is a tiny slice of quartz crystal. When we apply electricity to this crystal, it vibrates at a very precise frequency, like a microscopic tuning fork. The computer counts these vibrations—say, 32,768 times per second—and uses that count to advance the clock by one second.
 
-This quartz crystal is incredibly convenient and cheap, but it has a secret flaw: it is highly sensitive to the world around it. If your room gets warmer or colder, the crystal vibrates a little faster or slower. As the crystal ages, its rate changes. Even tiny imperfections from the factory mean that no two quartz crystals are exactly identical. 
+This quartz crystal is convenient and cost-effective, but it is sensitive to environmental factors. If your room gets warmer or colder, the crystal vibrates a little faster or slower. As the crystal ages, its rate changes. Even tiny imperfections from the factory mean that no two quartz crystals are exactly identical. 
 
 Because of these factors, your computer's internal clock constantly drifts. It might gain or lose a few seconds every single day. If left to itself, your computer would eventually drift minutes or hours out of sync.
 
@@ -64,7 +64,7 @@ Because we know the satellite's exact path in space from its orbital data, the s
 
 By analyzing this curve, we can solve two mysteries at once:
 1. **Where we are**: We can pinpoint our own latitude and longitude on Earth.
-2. **What time it is**: We can calculate the exact error of our local computer clock and "steer" it back to matching the satellite's atomic time. We adjust our clock phase and speed to align perfectly with the cosmos.
+2. **What time it is**: We can calculate the exact error of our local computer clock and "steer" it back to matching the satellite's atomic time. We adjust our clock phase and speed to align the local clock with the satellite's atomic time.
 
 ---
 
@@ -125,7 +125,7 @@ By predicting the wave's movement sample-by-sample, these robotic ears can block
 ## FAQ for Parents and Curious Minds
 
 ### Why cannot we just sync our clocks over the internet?
-Internet-based time synchronization is fantastic, but it requires a constant internet connection and is vulnerable to network congestion. If routing paths change, the time packets can be delayed, introducing errors. A satellite-guided system works completely offline, making it perfect for remote locations, emergency backup systems, or high-security networks that must remain isolated from the public internet.
+Internet-based time synchronization is fantastic, but it requires a constant internet connection and is vulnerable to network congestion. If routing paths change, the time packets can be delayed, introducing errors. A satellite-guided system works completely offline, making it suitable for remote locations, emergency backup systems, or high-security networks that must remain isolated from the public internet.
 
 ### Do we need a giant, expensive satellite dish?
 No. Because LEO satellites are relatively close to the Earth, their signals are strong. You can receive them using a simple dipole or turnstile antenna made from spare wire or measuring tape, connected to a cheap USB software-defined radio receiver.
@@ -134,24 +134,24 @@ No. Because LEO satellites are relatively close to the Earth, their signals are 
 Yes. Low Earth Orbit satellites broadcast their telemetry and signals publicly on amateur and weather bands. We are only receiving these signals, not transmitting anything. It is completely passive and legal.
 
 ### What level of accuracy can we achieve with this setup?
-By combining decimation filtering, spur notching, and the Kalman Filter, a standard computer clock can be disciplined to stay within a few microseconds of UTC (Coordinated Universal Time), which is far more accurate than standard internet time synchronization.
+By combining decimation filtering, spur notching, and the Kalman Filter, a standard computer clock can be disciplined to stay within a few microseconds of UTC (Coordinated Universal Time), which is designed to achieve microsecond-level accuracy.
 
 ### Summary for Parents
 Our home-built system is a mini-science laboratory. It combines physics (the Doppler effect), orbital mechanics (tracking satellites in space), digital signal processing (cleaning up radio signals), and advanced estimation math (the Kalman Filter). It shows how a simple computer can be turned into a highly precise scientific instrument using open-source software and basic radio hardware.
 
 ---
 
-## 6. Advanced Phase 10 Algorithms: Quantum-Leap Innovations
+## 6. Advanced Signal Processing and Optimization Algorithms
 
 To push the performance of `sattime` to the absolute limits of RF and mathematical engineering, we introduced four advanced algorithms. These algorithms solve the hardest problems in satellite tracking: finding orbits from scratch, rejecting false signals, notching out persistent background hums, and establishing a universal volume control.
 
-Let us explore these four breakthrough additions through simple, real-world analogies.
+Let us explore these four additions through simple, real-world analogies.
 
 ### 1. The Adelic Langevin Solver: The Smart Mountain Climber
 Imagine you are blindfolded and dropped onto a rugged mountain range, and you want to find the highest peak. 
 - **The Old Way (Grid Search)**: You would walk in a rigid grid pattern across the mountains, taking steps exactly every 50 feet. If the peak is small and sits between your grid lines, you will walk right past it and miss it entirely. This is slow, mechanical, and easily misses the target.
 - **The Adelic Langevin Solver**: Instead of walking mindlessly, you use a smart stochastic climber. The climber feels the slope under their feet (the gradient) and walks upward. To avoid getting stuck in a small ditch, the climber occasionally "teleports" randomly to nearby spots. 
-But here is the magic: these teleports are guided by *p-adic* numbers. Instead of just walking on continuous paths, the climber jumps back and forth across a discrete fractal map. By combining smooth continuous steps (using standard real numbers) with fractal jumps (using discrete $p$-adic primes), the solver can search massive orbital spaces without getting stuck in local traps, finding the satellite's exact orbit with incredible speed and accuracy.
+The key aspect of this approach is: these teleports are guided by *p-adic* numbers. Instead of just walking on continuous paths, the climber jumps back and forth across a discrete fractal map. By combining smooth continuous steps (using standard real numbers) with fractal jumps (using discrete $p$-adic primes), the solver can search massive orbital spaces without getting stuck in local traps, finding the satellite's exact orbit with incredible speed and accuracy.
 
 ### 2. Sheaf Cohomology & Čech Obstruction: Overlapping Opinions
 Imagine you are in a crowded, echoey room trying to write down what a speaker is saying. You have three listeners in different parts of the room.
@@ -195,7 +195,7 @@ The radio antenna receives a massive, single stream of raw wideband signals cont
 ### 4. Weighted NTP Consensus Clock Steering: The Council of Watchmakers
 When you ask multiple satellites what time it is, they will give you slightly different answers due to noise, atmospheric delay, and receiver variations.
 - **The Old Way**: You update the clock based on the single satellite you tracked. If that satellite's signal was weak or low on the horizon, your clock might get steered incorrectly.
-- **Weighted Consensus**: Imagine a council of watchmakers voting on the correct time. Instead of giving everyone an equal vote, the leader asks: "How clear is your vision?" (SNR), "How high was the sun when you looked?" (elevation), and "How steady is your hand?" (fit RMSE). The council trusts the watchmaker who had a crystal-clear view of a high-overhead pass with a perfect mathematical fit. By taking a weighted average, the system steers the system clock smoothly and reliably.
+- **Weighted Consensus**: Imagine a council of watchmakers voting on the correct time. Instead of giving everyone an equal vote, the leader asks: "How clear is your vision?" (SNR), "How high was the sun when you looked?" (elevation), and "How steady is your hand?" (fit RMSE). The council trusts the watchmaker who had a crystal-clear view of a high-overhead pass with a high-quality mathematical fit. By taking a weighted average, the system steers the system clock smoothly and reliably.
 
 ### 5. Real-Time 3D Geodetic Geolocation: The Spherical Spotlight
 If you are lost in a vast forest, you can pinpoint your location if you know your distance to several landmarks.
