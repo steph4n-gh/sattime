@@ -1,0 +1,97 @@
+# `sattime`: LEO Satellite Tracking Receiver & Time Server
+
+![sattime Banner](docs/sattime_banner.png)
+
+`sattime` is a high-performance, Rust-based Software Defined Radio (SDR) carrier-tracking receiver and atomic-disciplined time server daemon. Designed for Low Earth Orbit (LEO) satellite constellations (e.g., Starlink, NOAA, Orbcomm, Iridium), the system uses passive Doppler oscillometry to achieve decimeter-level relative positioning and microsecond-level local system clock synchronization—completely offline, without requiring a commercial internet connection.
+
+---
+
+## Key Components
+
+- **LEO Doppler Tracking**: Actively tracks high-velocity Doppler frequency curves from LEO satellites passing overhead to compute relative motion.
+- **Multi-Channel Parallel Tracking**: Concurrently tracks up to 8 satellites in parallel, distributing digital downconversion (DDC) and decimation filters across a Rayon-backed thread pool for real-time operation.
+- **3-State Carrier PLL-EKF**: A sample-by-sample Extended Kalman Filter (PLL-EKF) that tracks carrier phase, frequency, and chirp-rate (frequency acceleration) to lock onto weak satellite downlink signals even in extreme noise.
+- **Gardner Symbol Timing Recovery**: A feedback timing loop utilizing a Farrow parabolic interpolator and Proportional-Integral (PI) loop filter to achieve sub-sample symbol synchronization on PSK telemetry.
+- **Reverse-GPS Geodetic Solver**: A geodetic Gauss-Newton solver that computes the receiver's 3D coordinates on the WGS84 ellipsoid by fitting observed Doppler curves against known satellite orbits (TLEs).
+- **LEODO Clock Discipline**: A Low Earth Orbit Doppler Oscillometry EKF that measures local quartz oscillator phase and frequency drift, steering the host system clock to microsecond-level accuracy via the `libc::adjtime` system call.
+- **Real-Time Ratatui TUI**: An interactive terminal dashboard that displays the RF spectrum analyzer, EKF tracker state metrics, real-time clock discipline statistics, and an ASCII world tracking map with probability shading.
+
+---
+
+## Build & Hardware Requirements
+
+### Software Requirements
+- **Rust Toolchain**: Stable compiler (Rust 1.70+ recommended).
+- **Operating System**: Linux or macOS. (Clock discipline features require `libc::adjtime`).
+- **Dependencies**:
+  - `libusb` (for hardware SDR communication).
+  - `SoapySDR` library and driver modules for your receiver.
+  - A C compiler and `pkg-config` for building FFI bindings.
+
+### Hardware Requirements
+- **SDR Receiver**: RTL-SDR, HackRF, LimeSDR, Airspy, or any other receiver supported by SoapySDR.
+- **Antenna**: A VHF/UHF antenna suitable for LEO reception (e.g., a simple dipole, turnstile, QFH, or eggbeater antenna tuned to the satellite frequencies).
+
+---
+
+## Running Instructions
+
+### 1. Live SDR Mode
+Stream samples directly from a connected RTL-SDR receiver to track satellites in real time:
+```bash
+cargo run --release -- --sdr "driver=rtlsdr"
+```
+
+### 2. Simulation Mode
+Run a simulated satellite pass using a specific Two-Line Element (TLE) file, center frequency, and enable the LEODO clock steering loop:
+```bash
+cargo run --release -- --simulate --tle passes/starlink.tle --frequency 150800000.0 --leodo
+```
+
+### 3. Orbit Solver Mode
+Determine circular orbital parameters ($a, i, \Omega_0, u_0$) and pass-specific clock offsets from raw frequency measurement logs:
+```bash
+cargo run --release -- --solve-orbit passes/pass_1.csv,passes/pass_2.csv
+```
+
+---
+
+## TUI Keyboard Commands
+
+When running the visual dashboard, use the following interactive hotkeys:
+
+| Key | Action |
+|:---:|---|
+| `q` / `Esc` | Quit the application |
+| `j` / `k` | Scroll the visual diagnostic logs **Down** / **Up** |
+| `PageDown` / `PageUp` | Scroll the visual diagnostic logs **Down** / **Up** by 5 lines |
+| `a` | Toggle **Automatic Gain Control (AGC)** ON / OFF |
+| `n` | Toggle **Dynamic Background Spur Notching (Spur Notcher)** ON / OFF |
+| `g` | Toggle the RF pre-amplifier gain between **0.0 dB** and **14.0 dB** |
+| `Up` / `Down` | Increase / decrease **LNA gain by 8.0 dB** (forces Manual Mode, disables AGC) |
+| `Left` / `Right` | Decrease / increase **VGA gain by 2.0 dB** (forces Manual Mode, disables AGC) |
+| `1` | Switch active satellite profile to **NOAA** |
+| `2` | Switch active satellite profile to **Orbcomm** |
+| `3` | Switch active satellite profile to **Iridium** |
+| `4` | Switch active satellite profile to **Starlink** |
+| `5` | Switch active satellite profile to **Amateur** |
+
+---
+
+## File Structure
+
+- **`src/`**: Rust source code for the time server.
+  - `src/main.rs`: Application orchestrator, hardware SDR I/O loops, and TUI control logic.
+  - `src/dsp.rs`: Digital signal processing (Farrow interpolators, decimators, Gardner TED, and spur notchers).
+  - `src/ekf.rs`: Extended Kalman Filter implementations (Carrier phase-tracking PLL-EKF, EKF tracking banks, and Clock EKF).
+  - `src/orbit.rs`: Geodetic coordinate solvers, ECEF/ENU frame conversions, SGP4 propagation, and Haversine probability shading.
+  - `src/orbit_solver.rs`: Adelic Langevin Solver and multi-pass circular orbit parameter estimator.
+  - `src/daemon.rs`: Background task scheduling, TLE caching, and NTP system clock discipline.
+  - `src/tui.rs`: Terminal UI components rendering, stdout bells, and FFI stderr redirections.
+- **`docs/`**: Detailed project guides.
+  - `docs/conceptual_guide.md`: Accessible, analogy-driven explanations of the core tracking and signal processing algorithms.
+  - `docs/technical_reference.md`: Rigorous mathematical formulations, physical equations, and RF engineering specifications.
+- **`tests/`**: Unit, integration, and stress test suites.
+- **`passes/`**: Reference TLE and pass recording CSV files.
+
+For deeper insights, please read the [Conceptual Guide](docs/conceptual_guide.md) and the [Technical Reference](docs/technical_reference.md).

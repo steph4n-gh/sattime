@@ -1,0 +1,363 @@
+use crate::dsp::*;
+use crate::ekf::*;
+use crate::orbit::*;
+use crate::tui::*;
+use chrono::{DateTime, Datelike, Timelike, Utc};
+use num_complex::Complex;
+use rustfft::FftPlanner;
+use sgp4::Elements;
+use std::collections::VecDeque;
+use std::io::{self, Read, Write};
+pub static LEODO_LOOP: std::sync::OnceLock<std::sync::Mutex<LeodoLoop>> =
+    std::sync::OnceLock::new();
+
+pub struct LeodoLoop {
+    pub clock_ekf: ClockEkf,
+    pub last_update: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_offset: f64,
+    pub last_freq_err_ppm: f64,
+    pub last_target_adjustment: f64,
+    pub last_status: String,
+    pub synchronized: bool,
+    pub pending_step_adjustment: Option<f64>,
+}
+
+impl LeodoLoop {
+    pub fn new() -> Self {
+        Self {
+            clock_ekf: ClockEkf::new(),
+            last_update: None,
+            last_offset: 0.0,
+            last_freq_err_ppm: 0.0,
+            last_target_adjustment: 0.0,
+            last_status: String::from("FREE_RUN"),
+            synchronized: false,
+            pending_step_adjustment: None,
+        }
+    }
+}
+
+pub fn get_leodo_loop() -> &'static std::sync::Mutex<LeodoLoop> {
+    LEODO_LOOP.get_or_init(|| std::sync::Mutex::new(LeodoLoop::new()))
+}
+
+pub fn perform_clock_step(target_adjustment: f64) -> Result<(), std::io::Error> {
+    use std::time::SystemTime;
+    let now = SystemTime::now();
+    let since_the_epoch = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(std::io::Error::other)?;
+
+    let current_secs = since_the_epoch.as_secs_f64();
+    let target_secs = current_secs + target_adjustment;
+
+    #[cfg(target_os = "linux")]
+    {
+        let ts = libc::timespec {
+            tv_sec: target_secs.trunc() as libc::time_t,
+            tv_nsec: ((target_secs.fract() * 1_000_000_000.0) as i64) as libc::c_long,
+        };
+        let ret = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let tv = libc::timeval {
+            tv_sec: target_secs.trunc() as libc::time_t,
+            tv_usec: ((target_secs.fract() * 1_000_000.0) as i32) as libc::suseconds_t,
+        };
+        let ret = unsafe { libc::settimeofday(&tv, std::ptr::null()) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Platform not supported for clock stepping",
+        ))
+    }
+}
+
+#[cfg(target_family = "unix")]
+pub fn steer_system_clock(
+    offset_seconds: f64,
+    lo_bias: f64,
+    center_freq: f64,
+    log_path: &str,
+    enable_steering: bool,
+    leodo_loop: &mut LeodoLoop,
+) -> Vec<String> {
+    let now = chrono::Utc::now();
+    let mut msgs: Vec<String> = Vec::new();
+
+    // Calculate frequency error in PPM
+    let freq_err_ppm = (lo_bias / center_freq) * 1_000_000.0;
+
+    // Update EKF & PI loop
+    let dt = if let Some(last) = leodo_loop.last_update {
+        (now - last).num_milliseconds() as f64 / 1000.0
+    } else {
+        0.0
+    };
+
+    if dt > 0.0 {
+        leodo_loop.clock_ekf.predict(dt);
+    }
+    leodo_loop.clock_ekf.update(offset_seconds, freq_err_ppm);
+
+    // Compute the target adjustment from the EKF phase offset
+    let target_adjustment = leodo_loop.clock_ekf.x[0];
+
+    let status_str;
+    let mut actual_slewed = 0.0;
+
+    if enable_steering {
+        // Step-once on the first synchronization event if offset > 100 ms
+        if !leodo_loop.synchronized && target_adjustment.abs() > 0.1 {
+            match perform_clock_step(target_adjustment) {
+                Ok(_) => {
+                    actual_slewed = target_adjustment;
+                    leodo_loop.synchronized = true;
+                    leodo_loop.pending_step_adjustment = Some(target_adjustment);
+
+                    // Reset last_update to prevent bad dt transition
+                    leodo_loop.last_update = None;
+
+                    status_str = format!("SUCCESS_STEP (stepped {:.6}s)", target_adjustment);
+                    msgs.push(format!(
+                        "[LEODO] Successfully stepped system clock by {:.6}s",
+                        target_adjustment
+                    ));
+                }
+                Err(err) => {
+                    leodo_loop.synchronized = true; // Lock stepping even if it failed/EPERM so subsequent steering uses slewing
+                    let target_epoch = (now
+                        + chrono::Duration::microseconds((target_adjustment * 1_000_000.0) as i64))
+                    .timestamp();
+                    #[cfg(target_os = "macos")]
+                    let override_cmd = format!("sudo date -f \"%s\" \"{}\"", target_epoch);
+                    #[cfg(not(target_os = "macos"))]
+                    let override_cmd = format!("sudo date -s \"@{}\"", target_epoch);
+
+                    if err.raw_os_error() == Some(libc::EPERM) {
+                        status_str =
+                            "ERROR_STEP EPERM (permission denied, run as root/sudo)".to_string();
+                        msgs.push(format!(
+                            "[LEODO] Clock stepping failed: Permission denied. Run as sudo, or: {}",
+                            override_cmd
+                        ));
+                    } else {
+                        status_str = format!("ERROR_STEP: {}", err);
+                        msgs.push(format!("[LEODO] Clock stepping failed: {}", err));
+                    }
+                }
+            }
+        } else {
+            // Subsequent adjustment or small offset: gradual slewing
+            leodo_loop.synchronized = true;
+            leodo_loop.last_update = Some(now);
+
+            // Prepare the timeval struct for libc::adjtime
+            let sec = target_adjustment.trunc() as libc::time_t;
+            let usec = ((target_adjustment.fract() * 1_000_000.0) as i32) as libc::suseconds_t;
+
+            let delta = libc::timeval {
+                tv_sec: sec,
+                tv_usec: usec,
+            };
+
+            let mut old_delta = libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            };
+
+            // unsafe block to call the native OS API
+            let ret = unsafe { libc::adjtime(&delta, &mut old_delta) };
+            if ret == 0 {
+                actual_slewed = 0.0; // Audit Fix S5/S6: adjtime is gradual, no instant step occurred
+                status_str = format!("SUCCESS_SLEW (target {:.6}s)", target_adjustment);
+                msgs.push(format!(
+                    "[LEODO] Successfully requested OS clock slew of {:.6}s",
+                    target_adjustment
+                ));
+            } else {
+                let err = std::io::Error::last_os_error();
+                let target_epoch = (now
+                    + chrono::Duration::microseconds((target_adjustment * 1_000_000.0) as i64))
+                .timestamp();
+                #[cfg(target_os = "macos")]
+                let override_cmd = format!("sudo date -f \"%s\" \"{}\"", target_epoch);
+                #[cfg(not(target_os = "macos"))]
+                let override_cmd = format!("sudo date -s \"@{}\"", target_epoch);
+
+                if err.raw_os_error() == Some(libc::EPERM) {
+                    status_str =
+                        "ERROR_SLEW EPERM (permission denied, run as root/sudo)".to_string();
+                    msgs.push(format!(
+                        "[LEODO] Clock slewing failed: Permission denied. Run as sudo, or: {}",
+                        override_cmd
+                    ));
+                } else {
+                    status_str = format!("ERROR_SLEW: {}", err);
+                    msgs.push(format!("[LEODO] Clock slewing failed: {}", err));
+                }
+            }
+        }
+    } else {
+        status_str = format!("DRY RUN (calculated {:.6}s adjustment)", target_adjustment);
+        msgs.push(format!(
+            "[LEODO] Dry run: Time offset {:.6}s, EKF phase offset {:.6}s, drift {:.3} PPM",
+            offset_seconds, target_adjustment, leodo_loop.clock_ekf.x[1]
+        ));
+
+        leodo_loop.synchronized = true;
+        leodo_loop.last_update = Some(now);
+    }
+
+    // Apply control feedback step correction to EKF phase state
+    leodo_loop.clock_ekf.x[0] -= actual_slewed;
+
+    leodo_loop.last_offset = offset_seconds;
+    leodo_loop.last_freq_err_ppm = leodo_loop.clock_ekf.x[1];
+    leodo_loop.last_target_adjustment = target_adjustment;
+    leodo_loop.last_status = status_str.clone();
+
+    // Write to the log file
+    if let Some(parent) = std::path::Path::new(log_path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        let log_line = format!(
+            "{},{},{:.6},{:.3},{:.6},{:.6},{}\n",
+            now.to_rfc3339(),
+            center_freq,
+            offset_seconds,
+            leodo_loop.clock_ekf.x[1],
+            target_adjustment,
+            actual_slewed,
+            status_str
+        );
+        let _ = file.write_all(log_line.as_bytes());
+    }
+    msgs
+}
+
+#[cfg(not(target_family = "unix"))]
+pub fn steer_system_clock(
+    offset_seconds: f64,
+    lo_bias: f64,
+    center_freq: f64,
+    log_path: &str,
+    enable_steering: bool,
+    leodo_loop: &mut LeodoLoop,
+) -> Vec<String> {
+    let mut msgs = vec!["[LEODO] Clock steering is not supported on this platform.".to_string()];
+    let now = chrono::Utc::now();
+    let dt = if let Some(last) = leodo_loop.last_update {
+        (now - last).num_milliseconds() as f64 / 1000.0
+    } else {
+        0.0
+    };
+    leodo_loop.last_update = Some(now);
+
+    let freq_err_ppm = (lo_bias / center_freq) * 1_000_000.0;
+
+    if dt > 0.0 {
+        leodo_loop.clock_ekf.predict(dt);
+    }
+    leodo_loop.clock_ekf.update(offset_seconds, freq_err_ppm);
+
+    let target_adjustment = leodo_loop.clock_ekf.x[0];
+    leodo_loop.synchronized = true;
+    leodo_loop.last_offset = offset_seconds;
+    leodo_loop.last_freq_err_ppm = leodo_loop.clock_ekf.x[1];
+    leodo_loop.last_target_adjustment = target_adjustment;
+    leodo_loop.last_status = format!("NOT_SUPPORTED (dry EKF target: {:.6}s)", target_adjustment);
+    msgs
+}
+
+pub enum DaemonState {
+    Searching,
+    Capturing {
+        start_time: DateTime<Utc>,
+        samples: Vec<(DateTime<Utc>, f64)>,
+        last_lock_time: DateTime<Utc>,
+    },
+}
+
+pub struct CompletedPassData {
+    pub sat_name: String,
+    pub timestamp: DateTime<Utc>,
+    pub offset_seconds: f64,
+    pub freq_drift_ppm: f64,
+    pub snr: f64,
+    pub max_elevation: f64,
+    pub fit_rmse: f64,
+}
+
+pub struct ConsensusSteeringEngine {
+    pub passes: Vec<CompletedPassData>,
+}
+
+impl ConsensusSteeringEngine {
+    pub fn new() -> Self {
+        Self { passes: Vec::new() }
+    }
+
+    pub fn add_pass_result(&mut self, pass: CompletedPassData) {
+        self.passes.push(pass);
+    }
+
+    pub fn get_consensus_update(&self) -> Option<(f64, f64)> {
+        if self.passes.is_empty() {
+            return None;
+        }
+
+        let mut total_weight = 0.0;
+        let mut weighted_offset = 0.0;
+        let mut weighted_drift = 0.0;
+
+        for pass in &self.passes {
+            // Outlier rejection: SNR must be >= 3.0, fit_rmse must be <= 100.0
+            if pass.fit_rmse > 100.0 || pass.snr < 3.0 {
+                continue;
+            }
+
+            // Weight calculation based on SNR, elevation, and fit RMSE
+            let snr_weight = (pass.snr - 3.0).max(0.0);
+            let elev_weight = (pass.max_elevation.to_radians()).sin().max(0.0);
+            let rmse_weight = 1.0 / (pass.fit_rmse.max(0.1));
+
+            let weight = snr_weight * elev_weight * rmse_weight;
+
+            if weight > 0.0 {
+                total_weight += weight;
+                weighted_offset += pass.offset_seconds * weight;
+                weighted_drift += pass.freq_drift_ppm * weight;
+            }
+        }
+
+        if total_weight > 0.0 {
+            Some((
+                weighted_offset / total_weight,
+                weighted_drift / total_weight,
+            ))
+        } else {
+            None
+        }
+    }
+}
