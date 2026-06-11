@@ -2,10 +2,17 @@
 
 ![sattime TUI Screenshot](docs/sattime_screenshot.jpg)
 
-`sattime` is a high-performance, Rust-based Software Defined Radio (SDR) carrier-tracking receiver and satellite-disciplined time server daemon. Designed for Low Earth Orbit (LEO) satellite constellations (e.g., Starlink, NOAA, Orbcomm, Iridium), the system uses passive Doppler oscillometry to achieve relative positioning and microsecond-level local system clock synchronization—completely offline, without requiring a commercial internet connection.
+`sattime` is a high-performance, Rust-based Software Defined Radio (SDR) carrier-tracking receiver and satellite-disciplined time server daemon. Designed for Low Earth Orbit (LEO) satellite constellations (e.g., Starlink, NOAA, Orbcomm, Iridium), the system uses passive Doppler oscillometry to achieve relative positioning and millisecond-level local system clock synchronization—completely offline, without requiring a commercial internet connection.
 
 > [!NOTE]
 > **Real-World Testing & Hardware Setup**: During active development and live testing, the system consistently achieved signal locks and converged geodetic solutions using a highly accessible, indoor hardware setup: a simple **metal whip antenna magnetically mounted to a cookie sheet** (acting as a ground plane) sitting **inside a basement**, connected to a **HackRF One** SDR. This highlights the robustness of the 3-state carrier PLL-EKF and symbol tracking algorithms under heavily obstructed, non-ideal signal conditions.
+
+> [!WARNING]
+> **Important Hardware & Physics Disclaimers**:
+> 
+> * **Absolute UTC Accuracy Limits (SGP4 & USB Jitter)**: Achieving absolute microsecond-level UTC synchronization is physically constrained by the data sources and hardware interface. SGP4 TLEs have inherent along-track spatial errors (often hundreds of meters to kilometers), translating to $\approx 100\text{ ms}$ of timing uncertainty. Furthermore, host OS interrupt scheduling and USB contention introduce $1\text{–}5\text{ ms}$ of delay jitter on incoming samples. Consequently, the system is designed to achieve **millisecond-level** absolute UTC accuracy (comparable to network NTP) but delivers highly stable **relative** timing/phase tracking.
+> * **TCXO Module Required for HackRF Geodetic Solving**: Standard SDRs like the stock HackRF One use uncompensated crystal oscillators (LO drift up to 10–20 PPM). As the SDR warms up, its local oscillator will drift in a parabolic thermal curve, masquerading as satellite acceleration (chirp) and distorting the Doppler S-curve. For reliable geodetic solving, users **must install a $15 TCXO (Temperature Compensated Crystal Oscillator) module** in their SDR.
+> * **Indoor Multipath Geolocation Limits**: In indoor environments (e.g., basements), VHF signals bounce off pipes, concrete, and obstacles. While the sheaf cohomology/EKF tracking bank will maintain a carrier lock, multipath propagation geometrically distorts the observed Doppler curve. The geodetic solver will converge, but the resulting WGS84 coordinate error can be up to tens of kilometers rather than precise meters.
 
 ---
 
@@ -16,7 +23,7 @@
 - **3-State Carrier PLL-EKF**: A sample-by-sample Extended Kalman Filter (PLL-EKF) that tracks carrier phase, frequency, and chirp-rate (frequency acceleration) to lock onto weak satellite downlink signals even in extreme noise.
 - **Gardner Symbol Timing Recovery**: A feedback timing loop utilizing a Farrow parabolic interpolator and Proportional-Integral (PI) loop filter to achieve sub-sample symbol synchronization on PSK telemetry.
 - **Reverse-GPS Geodetic Solver**: A geodetic Gauss-Newton solver that computes the receiver's 3D coordinates on the WGS84 ellipsoid by fitting observed Doppler curves against known satellite orbits (TLEs).
-- **LEODO Clock Discipline**: A Low Earth Orbit Doppler Oscillometry EKF that measures local quartz oscillator phase and frequency drift, steering the host system clock to microsecond-level accuracy via the `libc::adjtime` system call.
+- **LEODO Clock Discipline**: A Low Earth Orbit Doppler Oscillometry EKF that measures local quartz oscillator phase and frequency drift, steering the host system clock to millisecond-level absolute accuracy via the `libc::adjtime` system call or by writing offsets to an NTP Shared Memory (SHM) segment via `--leodo-shm`.
 - **Real-Time Ratatui TUI**: An interactive terminal dashboard that displays the RF spectrum analyzer, EKF tracker state metrics, real-time clock discipline statistics, and an ASCII world tracking map with probability shading.
 
 ---

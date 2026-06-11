@@ -140,8 +140,7 @@ impl CarrierPllEkf {
         self.x = f * self.x;
 
         let (limit, half_limit) = match self.modulation {
-            Modulation::Carrier => (2.0 * std::f64::consts::PI, std::f64::consts::PI),
-            Modulation::Bpsk => (std::f64::consts::PI, std::f64::consts::PI / 2.0),
+            Modulation::Carrier | Modulation::Bpsk => (2.0 * std::f64::consts::PI, std::f64::consts::PI),
             Modulation::Qpsk => (std::f64::consts::PI / 2.0, std::f64::consts::PI / 4.0),
         };
         self.x[0] = (self.x[0] + half_limit).rem_euclid(limit) - half_limit;
@@ -171,14 +170,18 @@ impl CarrierPllEkf {
     }
 
     pub fn update(&mut self, sample: Complex<f32>) {
+        let sample_to_use = match self.modulation {
+            Modulation::Bpsk => sample * sample,
+            _ => sample,
+        };
         let theta_pred = self.x[0];
 
         let cos_theta = (-theta_pred).cos();
         let sin_theta = (-theta_pred).sin();
-        let derotated_re = sample.re as f64 * cos_theta - sample.im as f64 * sin_theta;
-        let derotated_im = sample.re as f64 * sin_theta + sample.im as f64 * cos_theta;
+        let derotated_re = sample_to_use.re as f64 * cos_theta - sample_to_use.im as f64 * sin_theta;
+        let derotated_im = sample_to_use.re as f64 * sin_theta + sample_to_use.im as f64 * cos_theta;
 
-        let amp = (sample.re as f64).hypot(sample.im as f64);
+        let amp = (sample_to_use.re as f64).hypot(sample_to_use.im as f64);
 
         // Dynamic SNR-based measurement noise scaling & envelope check
         let alpha = 0.005;
@@ -197,16 +200,9 @@ impl CarrierPllEkf {
         let r_effective = self.r_meas * snr_factor * fade_factor;
 
         let (z, norm_re) = match self.modulation {
-            Modulation::Carrier => {
+            Modulation::Carrier | Modulation::Bpsk => {
                 let z = derotated_im.atan2(derotated_re);
                 let norm_re = z.cos();
-                (z, norm_re)
-            }
-            Modulation::Bpsk => {
-                let two_i_q = 2.0 * derotated_re * derotated_im;
-                let i_sq_minus_q_sq = derotated_re * derotated_re - derotated_im * derotated_im;
-                let z = 0.5 * two_i_q.atan2(i_sq_minus_q_sq);
-                let norm_re = (2.0 * z).cos();
                 (z, norm_re)
             }
             Modulation::Qpsk => {
@@ -270,8 +266,7 @@ impl CarrierPllEkf {
         self.x += k * z;
 
         let (limit, half_limit) = match self.modulation {
-            Modulation::Carrier => (2.0 * std::f64::consts::PI, std::f64::consts::PI),
-            Modulation::Bpsk => (std::f64::consts::PI, std::f64::consts::PI / 2.0),
+            Modulation::Carrier | Modulation::Bpsk => (2.0 * std::f64::consts::PI, std::f64::consts::PI),
             Modulation::Qpsk => (std::f64::consts::PI / 2.0, std::f64::consts::PI / 4.0),
         };
         self.x[0] = (self.x[0] + half_limit).rem_euclid(limit) - half_limit;
@@ -359,9 +354,10 @@ impl EkfTrackingBank {
     }
 
     pub fn compute_tracker_frequency_diffs(&self) -> Vec<f32> {
-        let f0 = (self.trackers[0].x[1] / (2.0 * std::f64::consts::PI)) as f32;
-        let f1 = (self.trackers[1].x[1] / (2.0 * std::f64::consts::PI)) as f32;
-        let f2 = (self.trackers[2].x[1] / (2.0 * std::f64::consts::PI)) as f32;
+        let scale = if self.trackers[0].modulation == Modulation::Bpsk { 2.0 } else { 1.0 };
+        let f0 = ((self.trackers[0].x[1] / scale) / (2.0 * std::f64::consts::PI)) as f32;
+        let f1 = ((self.trackers[1].x[1] / scale) / (2.0 * std::f64::consts::PI)) as f32;
+        let f2 = ((self.trackers[2].x[1] / scale) / (2.0 * std::f64::consts::PI)) as f32;
 
         vec![
             f1 - f0, // tracker 0 vs 1

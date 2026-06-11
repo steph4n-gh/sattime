@@ -118,7 +118,8 @@ fn test_demod_channel_init() {
 #[test]
 fn test_demod_channel_ddc_mixing() {
     let mut channel = DemodChannel::new(1000.0, 10000.0, "SAT_1".to_string());
-    let input = vec![num_complex::Complex::new(1.0f32, 0.0f32); 4096];
+    let mut input = vec![num_complex::Complex::new(1.0f32, 0.0f32); 4096];
+    input[0] = num_complex::Complex::new(1.3f32, 0.0f32);
     channel.process_block(&input);
     assert_eq!(channel.mixed_samples.len(), input.len());
     // The mixed samples should be derotated: sample * exp(-j 2pi f t)
@@ -1523,4 +1524,33 @@ fn test_t4_real_world_gps_constellation_tracking() {
         "Receiver distance error is {:.2} meters",
         dist_err
     );
+}
+
+#[test]
+fn test_bussgang_and_subspace_projection() {
+    let mut channel = DemodChannel::new(1000.0, 10000.0, "SAT_1".to_string());
+    let input = vec![
+        num_complex::Complex::new(0.125f32, 0.25f32),
+        num_complex::Complex::new(0.25f32, 0.5f32),
+        num_complex::Complex::new(0.375f32, 0.75f32),
+    ];
+    channel.process_block(&input);
+    
+    assert_eq!(channel.normalized_iq.len(), 3);
+    
+    // Sample 0: (-0.125, -0.25) normalized
+    let expected_s0_re = -0.125f32 / ((0.078125f32).sqrt() + 1e-9f32);
+    let expected_s0_im = -0.25f32 / ((0.078125f32).sqrt() + 1e-9f32);
+    assert!((channel.normalized_iq[0].re - expected_s0_re).abs() < 1e-6);
+    assert!((channel.normalized_iq[0].im - expected_s0_im).abs() < 1e-6);
+    
+    // Sample 1: (0.0, 0.0) normalized
+    assert!((channel.normalized_iq[1].re - 0.0).abs() < 1e-6);
+    assert!((channel.normalized_iq[1].im - 0.0).abs() < 1e-6);
+    
+    // Sample 2: (0.125, 0.25) normalized
+    let expected_s2_re = 0.125f32 / ((0.078125f32).sqrt() + 1e-9f32);
+    let expected_s2_im = 0.25f32 / ((0.078125f32).sqrt() + 1e-9f32);
+    assert!((channel.normalized_iq[2].re - expected_s2_re).abs() < 1e-6);
+    assert!((channel.normalized_iq[2].im - expected_s2_im).abs() < 1e-6);
 }

@@ -102,13 +102,13 @@ A bad system would choose one or the other. A smart system uses a Kalman Filter.
 
 The Kalman Filter knows how both systems behave. It starts with the prediction model to guess where the car should be. When a new GPS measurement arrives, the filter calculates the difference between the prediction and the measurement. It then makes a smart guess, weighting the two based on their reliability. If the GPS signal is very noisy, it trusts the prediction more. If the wheels are slipping, it trusts the GPS more. The result is a smooth, highly accurate estimate of the car's true position.
 
-In `sattime`, the Kalman Filter tracks two states: our clock's phase offset (how many microseconds we are off) and its frequency drift (how fast the clock is running). 
+In `sattime`, the Kalman Filter tracks two states: our clock's phase offset (our offset from absolute UTC) and its frequency drift (how fast the clock is running). 
 
 It combines:
 - Our prediction of how the quartz crystal drifts over time.
 - The noisy frequency measurements from the satellite passes.
 
-By constantly balancing the prediction and the measurements, the Kalman Filter provides a continuous, highly stable estimate of the true time, allowing us to steer the computer clock with microsecond-level precision.
+By constantly balancing the prediction and the measurements, the Kalman Filter provides a continuous, highly stable estimate of the true time, allowing us to steer the computer clock with millisecond-level absolute accuracy (and microsecond-level relative phase stability).
 
 ### The Carrier EKF: Locking onto the Space Whistle
 In addition to the clock-steering filter, the receiver uses a second, ultra-fast Kalman Filter to lock onto the satellite's carrier signal. Think of this as a set of **robotic ears** that tune into the satellite's whistle. 
@@ -134,7 +134,15 @@ No. Because LEO satellites are relatively close to the Earth, their signals are 
 Yes. Low Earth Orbit satellites broadcast their telemetry and signals publicly on amateur and weather bands. We are only receiving these signals, not transmitting anything. It is completely passive and legal.
 
 ### What level of accuracy can we achieve with this setup?
-By combining decimation filtering, spur notching, and the Kalman Filter, a standard computer clock can be disciplined to stay within a few microseconds of UTC (Coordinated Universal Time), which is designed to achieve microsecond-level accuracy.
+By combining decimation filtering, spur notching, and the Kalman Filter, a standard computer clock can be disciplined to stay within a few milliseconds of absolute UTC (Coordinated Universal Time).
+
+> [!WARNING]
+> **Why Millisecond Limits?**
+> While the EKF tracking bank tracks relative phase and frequency variations with microsecond-level precision, absolute UTC timing is limited by two major real-world constraints:
+> 1. **TLE Orbital Limits (SGP4)**: Even daily-updated TLEs have along-track position uncertainties of hundreds of meters, translating to roughly $\approx 100\text{ ms}$ of absolute time bias at the point of closest approach.
+> 2. **OS/USB Latency Jitter**: Timestamps assigned to IQ buffers are stamped by the host OS when the buffer is received via USB, introducing $1\text{–}5\text{ ms}$ of interrupt/scheduling jitter.
+> 
+> For indoor operations, multipath propagation (reflections from walls/ground) also alters the signal's phase center, introducing geodetic positioning errors of up to tens of kilometers. Additionally, a stock crystal oscillator on cheap SDRs (like the HackRF One) will drift parabolically as the unit warms up, which can masquerade as orbital Doppler chirp. Adding a Temperature Compensated Crystal Oscillator (TCXO) module is highly recommended to stabilize these thermal curves.
 
 ### Summary for Parents
 Our home-built system is a mini-science laboratory. It combines physics (the Doppler effect), orbital mechanics (tracking satellites in space), digital signal processing (cleaning up radio signals), and advanced estimation math (the Kalman Filter). It shows how a simple computer can be turned into a highly precise scientific instrument using open-source software and basic radio hardware.

@@ -193,6 +193,10 @@ pub struct Args {
     #[arg(long = "leodo")]
     leodo: bool,
 
+    /// Enable NTP Shared Memory (SHM) output (unit number, e.g., 2 for NTP2)
+    #[arg(long = "leodo-shm")]
+    leodo_shm: Option<usize>,
+
     /// Log file to write LEODO NTP steering events
     #[arg(long = "leodo-log", default_value = "passes/leodo.log")]
     leodo_log: String,
@@ -508,7 +512,7 @@ fn check_and_save_pass_steering(
                 let pos_obs = wgs84_to_ecef(args.lat, args.lon, args.alt);
                 let lat_lon_alt = [args.lat, args.lon, args.alt];
                 let blind = args.blind;
-                let leodo = args.leodo;
+                let leodo = args.leodo || args.leodo_shm.is_some();
                 let leodo_log = args.leodo_log.clone();
                 let output_dir = args.output_dir.clone();
                 let tle_path_clone = tle_path.to_string();
@@ -599,6 +603,10 @@ fn main() {
         std::env::set_var("SOAPY_SDR_LOG_LEVEL", "WARNING");
     }
     let args = Args::parse();
+
+    if let Ok(mut loop_lock) = get_leodo_loop().lock() {
+        loop_lock.shm_unit = args.leodo_shm;
+    }
 
     if args.sample_rate <= 0.0 {
         eprintln!("Error: Sample rate must be positive and non-zero.");
@@ -702,7 +710,7 @@ fn main() {
             current_freq,
             [args.lat, args.lon, args.alt],
             args.blind,
-            args.leodo,
+            args.leodo || args.leodo_shm.is_some(),
             &args.leodo_log,
             false,
         );
@@ -2656,7 +2664,7 @@ fn main() {
                                         let freq = current_freq;
                                         let lat_lon_alt = [args.lat, args.lon, args.alt];
                                         let is_blind = args.blind;
-                                        let is_leodo = args.leodo;
+                                        let is_leodo = args.leodo || args.leodo_shm.is_some();
                                         let leodo_log_p = args.leodo_log.clone();
                                         let tx_solver = solver_tx.clone();
 
@@ -3608,8 +3616,8 @@ mod tests {
             tracker.predict();
             tracker.update(sample);
 
-            // Verify phase wrapping stays within expected bounds [-pi/2, pi/2)
-            let limit = std::f64::consts::PI / 2.0;
+            // Verify phase wrapping stays within expected bounds [-pi, pi) for 2pi wrapping limit
+            let limit = std::f64::consts::PI;
             assert!(
                 tracker.x[0] >= -limit && tracker.x[0] < limit,
                 "Phase out of BPSK bounds: {}",
@@ -3617,8 +3625,8 @@ mod tests {
             );
         }
 
-        // Est frequency should converge close to 20.0 Hz
-        let est_freq_hz = tracker.x[1] / (2.0 * std::f64::consts::PI);
+        // Est frequency should converge close to 20.0 Hz (after scaling EKF frequency by 2.0)
+        let est_freq_hz = tracker.x[1] / (2.0 * std::f64::consts::PI) / 2.0;
         let error = (est_freq_hz - target_freq_hz).abs();
         assert!(
             error < 1.5,
@@ -3660,6 +3668,29 @@ mod tests {
         assert!(
             loop_state_real.last_status.contains("STEP")
                 || loop_state_real.last_status.contains("EPERM")
+        );
+        let _ = std::fs::remove_file(log_path);
+
+        // Dry run with SHM enabled
+        let mut loop_state_shm_dry = LeodoLoop::new();
+        loop_state_shm_dry.shm_unit = Some(2);
+        loop_state_shm_dry.clock_ekf.x[0] = 0.5;
+        steer_system_clock(0.5, 0.0, 150.8e6, log_path, false, &mut loop_state_shm_dry);
+
+        assert!(loop_state_shm_dry.synchronized);
+        assert!(loop_state_shm_dry.last_status.contains("DRY RUN SHM"));
+        let _ = std::fs::remove_file(log_path);
+
+        // Run with enable_steering = true and shm_unit = Some(2)
+        let mut loop_state_shm = LeodoLoop::new();
+        loop_state_shm.shm_unit = Some(2);
+        loop_state_shm.clock_ekf.x[0] = 0.5;
+        steer_system_clock(0.5, 0.0, 150.8e6, log_path, true, &mut loop_state_shm);
+
+        assert!(loop_state_shm.synchronized);
+        assert!(
+            loop_state_shm.last_status.contains("SUCCESS_SHM")
+                || loop_state_shm.last_status.contains("ERROR_SHM")
         );
         let _ = std::fs::remove_file(log_path);
     }

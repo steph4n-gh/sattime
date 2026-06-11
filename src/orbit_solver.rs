@@ -34,6 +34,8 @@ pub struct SolvedOrbit {
     pub pass_dts: Vec<f64>,
     #[allow(dead_code)]
     pub pass_dfs: Vec<f64>,
+    pub pass_df1s: Vec<f64>,
+    pub pass_df2s: Vec<f64>,
 }
 
 #[allow(dead_code)]
@@ -283,6 +285,36 @@ pub fn predict_frequency(
     center_freq * doppler_factor - center_freq + df
 }
 
+pub fn predict_frequency_poly(
+    a: f64,
+    i: f64,
+    raan0: f64,
+    u0: f64,
+    epoch: DateTime<Utc>,
+    t_obs: DateTime<Utc>,
+    dt: f64,
+    df_poly: (f64, f64, f64),
+    t_ref: DateTime<Utc>,
+    center_freq: f64,
+    rec_ecef: [f64; 3],
+) -> f64 {
+    let t_adj = t_obs + chrono::Duration::milliseconds((dt * 1000.0) as i64);
+    let (pos_sat, vel_sat) = propagate_ecef_at_time(a, i, raan0, u0, epoch, t_adj, t_obs);
+    let dx = pos_sat[0] - rec_ecef[0];
+    let dy = pos_sat[1] - rec_ecef[1];
+    let dz = pos_sat[2] - rec_ecef[2];
+    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+    if dist < 1.0 {
+        return center_freq + df_poly.0;
+    }
+    let range_rate = (dx * vel_sat[0] + dy * vel_sat[1] + dz * vel_sat[2]) / dist;
+    let doppler_factor = 1.0 - range_rate / C;
+    let tau = (t_obs - t_ref).num_milliseconds() as f64 / 1000.0;
+    let bias = df_poly.0 + df_poly.1 * tau + df_poly.2 * tau * tau;
+    center_freq * doppler_factor - center_freq + bias
+}
+
+
 // Formulate the Keplerian parameters Levenberg-Marquardt solver
 pub fn fit_orbit_doppler(
     raw_passes: &[RawPass],
@@ -311,9 +343,9 @@ pub fn fit_orbit_doppler(
     let epoch = raw_passes[0].points[0].time;
     let center_freq = raw_passes[0].center_freq;
 
-    // We fit: [a, i, raan0, u0, dt_0, df_0, dt_1, df_1, ...]
-    // Total parameters: 4 + 2 * n_passes
-    let n_params = 4 + 2 * n_passes;
+    // We fit: [a, i, raan0, u0, dt_0, df0_0, df1_0, df2_0, dt_1, df0_1, df1_1, df2_1, ...]
+    // Total parameters: 4 + 4 * n_passes
+    let n_params = 4 + 4 * n_passes;
     let mut params = vec![0.0; n_params];
 
     // Keplerian Period Estimation from observed PCA times
@@ -760,8 +792,10 @@ pub fn fit_orbit_doppler(
 
         let pred_pca_time = pred_pcas[p_idx];
         let dt = (pred_pca_time - obs_pca_time).num_milliseconds() as f64 / 1000.0;
-        params[4 + 2 * p_idx] = dt;
-        params[4 + 2 * p_idx + 1] = 0.0;
+        params[4 + 4 * p_idx] = dt;
+        params[4 + 4 * p_idx + 1] = 0.0;
+        params[4 + 4 * p_idx + 2] = 0.0;
+        params[4 + 4 * p_idx + 3] = 0.0;
     }
 
     // Run Levenberg-Marquardt (Stage 2)
@@ -773,10 +807,13 @@ pub fn fit_orbit_doppler(
         // Compute residuals
         let mut residuals = Vec::new();
         for (p_idx, pass) in raw_passes.iter().enumerate() {
-            let dt = params[4 + 2 * p_idx];
-            let df = params[4 + 2 * p_idx + 1];
+            let dt = params[4 + 4 * p_idx];
+            let df0 = params[4 + 4 * p_idx + 1];
+            let df1 = params[4 + 4 * p_idx + 2];
+            let df2 = params[4 + 4 * p_idx + 3];
+            let t_ref = pass.points[0].time;
             for pt in &pass.points {
-                let pred = predict_frequency(
+                let pred = predict_frequency_poly(
                     params[0],
                     params[1],
                     params[2],
@@ -784,7 +821,8 @@ pub fn fit_orbit_doppler(
                     epoch,
                     pt.time,
                     dt,
-                    df,
+                    (df0, df1, df2),
+                    t_ref,
                     center_freq,
                     rec_ecef,
                 );
@@ -792,7 +830,7 @@ pub fn fit_orbit_doppler(
             }
         }
         for p_idx in 0..raw_passes.len() {
-            let dt = params[4 + 2 * p_idx];
+            let dt = params[4 + 4 * p_idx];
             residuals.push(dt * 10.0);
         }
 
@@ -811,10 +849,13 @@ pub fn fit_orbit_doppler(
             // Recompute residuals for the restored params (best_params)
             residuals.clear();
             for (p_idx, pass) in raw_passes.iter().enumerate() {
-                let dt = params[4 + 2 * p_idx];
-                let df = params[4 + 2 * p_idx + 1];
+                let dt = params[4 + 4 * p_idx];
+                let df0 = params[4 + 4 * p_idx + 1];
+                let df1 = params[4 + 4 * p_idx + 2];
+                let df2 = params[4 + 4 * p_idx + 3];
+                let t_ref = pass.points[0].time;
                 for pt in &pass.points {
-                    let pred = predict_frequency(
+                    let pred = predict_frequency_poly(
                         params[0],
                         params[1],
                         params[2],
@@ -822,7 +863,8 @@ pub fn fit_orbit_doppler(
                         epoch,
                         pt.time,
                         dt,
-                        df,
+                        (df0, df1, df2),
+                        t_ref,
                         center_freq,
                         rec_ecef,
                     );
@@ -830,7 +872,7 @@ pub fn fit_orbit_doppler(
                 }
             }
             for p_idx in 0..raw_passes.len() {
-                let dt = params[4 + 2 * p_idx];
+                let dt = params[4 + 4 * p_idx];
                 residuals.push(dt * 10.0);
             }
         }
@@ -846,22 +888,29 @@ pub fn fit_orbit_doppler(
         for k in 0..n_params {
             let mut perturbed = params.clone();
             let param_eps = if k == 0 {
-                10.0 // meters for semi-major axis
+                10.0 // meters
             } else if k == 1 || k == 2 || k == 3 {
-                1e-6 // radians for angles
-            } else if (k - 4) % 2 == 0 {
-                1e-3 // seconds for pass time offsets (dt)
+                1e-6 // radians
+            } else if (k - 4) % 4 == 0 {
+                1e-3 // dt (seconds)
+            } else if (k - 4) % 4 == 1 {
+                1e-2 // df0 (Hz)
+            } else if (k - 4) % 4 == 2 {
+                1e-4 // df1 (Hz/s)
             } else {
-                1e-2 // Hz for pass frequency biases (df)
+                1e-6 // df2 (Hz/s^2)
             };
             perturbed[k] += param_eps;
 
             let mut row_idx = 0;
             for (p_idx, pass) in raw_passes.iter().enumerate() {
-                let dt = perturbed[4 + 2 * p_idx];
-                let df = perturbed[4 + 2 * p_idx + 1];
+                let dt = perturbed[4 + 4 * p_idx];
+                let df0 = perturbed[4 + 4 * p_idx + 1];
+                let df1 = perturbed[4 + 4 * p_idx + 2];
+                let df2 = perturbed[4 + 4 * p_idx + 3];
+                let t_ref = pass.points[0].time;
                 for pt in &pass.points {
-                    let pred = predict_frequency(
+                    let pred = predict_frequency_poly(
                         perturbed[0],
                         perturbed[1],
                         perturbed[2],
@@ -869,7 +918,8 @@ pub fn fit_orbit_doppler(
                         epoch,
                         pt.time,
                         dt,
-                        df,
+                        (df0, df1, df2),
+                        t_ref,
                         center_freq,
                         rec_ecef,
                     );
@@ -879,7 +929,7 @@ pub fn fit_orbit_doppler(
                 }
             }
             for p_idx in 0..raw_passes.len() {
-                let dt = perturbed[4 + 2 * p_idx];
+                let dt = perturbed[4 + 4 * p_idx];
                 let diff = dt * 10.0;
                 jacobian[row_idx][k] = (diff - residuals[row_idx]) / param_eps;
                 row_idx += 1;
@@ -904,8 +954,26 @@ pub fn fit_orbit_doppler(
             jt_j[k][k] += lambda * jt_j[k][k];
         }
 
+        // Scale the system to prevent numerical underflow/overflow (Jacobi preconditioning)
+        let mut scaled_jt_j = jt_j.clone();
+        let mut scaled_jt_r = jt_r.clone();
+        let mut scale_factors = vec![0.0; n_params];
+        for i in 0..n_params {
+            let s = jt_j[i][i].sqrt();
+            scale_factors[i] = if s > 1e-15 { s } else { 1.0 };
+        }
+        for r in 0..n_params {
+            scaled_jt_r[r] /= scale_factors[r];
+            for c in 0..n_params {
+                scaled_jt_j[r][c] /= scale_factors[r] * scale_factors[c];
+            }
+        }
+
         // Solve the system via Gaussian elimination
-        if let Some(delta) = solve_linear_system(&mut jt_j, &jt_r) {
+        if let Some(mut delta) = solve_linear_system(&mut scaled_jt_j, &scaled_jt_r) {
+            for i in 0..n_params {
+                delta[i] /= scale_factors[i];
+            }
             let mut step_len = 0.0;
             for k in 0..n_params {
                 params[k] -= delta[k];
@@ -927,9 +995,13 @@ pub fn fit_orbit_doppler(
     params = best_params;
     let mut pass_dts = Vec::new();
     let mut pass_dfs = Vec::new();
+    let mut pass_df1s = Vec::new();
+    let mut pass_df2s = Vec::new();
     for j in 0..n_passes {
-        pass_dts.push(params[4 + 2 * j]);
-        pass_dfs.push(params[4 + 2 * j + 1]);
+        pass_dts.push(params[4 + 4 * j]);
+        pass_dfs.push(params[4 + 4 * j + 1]);
+        pass_df1s.push(params[4 + 4 * j + 2]);
+        pass_df2s.push(params[4 + 4 * j + 3]);
     }
 
     Ok(SolvedOrbit {
@@ -940,6 +1012,8 @@ pub fn fit_orbit_doppler(
         epoch,
         pass_dts,
         pass_dfs,
+        pass_df1s,
+        pass_df2s,
     })
 }
 

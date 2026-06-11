@@ -671,6 +671,7 @@ pub struct DemodChannel {
     pub telemetry_sender: Option<crossbeam_channel::Sender<TelemetryUpdate>>,
     pub mixed_samples: Vec<Complex<f32>>,
     pub decimated_samples: Vec<Complex<f32>>,
+    pub normalized_iq: Vec<Complex<f32>>,
     pub last_processed_len: usize,
     pub sample_count: usize,
 }
@@ -772,6 +773,7 @@ impl DemodChannel {
             telemetry_sender: None,
             mixed_samples: Vec::new(),
             decimated_samples: Vec::new(),
+            normalized_iq: Vec::new(),
             last_processed_len: 0,
             sample_count: 0,
         }
@@ -873,8 +875,31 @@ impl DemodChannel {
         let f_shift = freq_to_use - center_freq;
         self.mixed_samples
             .resize(raw_iq.len(), Complex::new(0.0, 0.0));
+
+        // a. Resize and copy raw_iq into self.normalized_iq.
+        self.normalized_iq.resize(raw_iq.len(), Complex::new(0.0, 0.0));
+        self.normalized_iq.copy_from_slice(raw_iq);
+
+        // b. Perform Subspace Projection for LO Leakage Cancellation by subtracting the block mean.
+        let n = self.normalized_iq.len() as f32;
+        let mut sum = Complex::new(0.0, 0.0);
+        for &s in &self.normalized_iq {
+            sum += s;
+        }
+        let mean = sum / n;
+        for s in &mut self.normalized_iq {
+            *s -= mean;
+        }
+
+        // c. Perform Bussgang Normalization (Constant Modulus Projection).
+        for s in &mut self.normalized_iq {
+            let norm = s.norm();
+            *s = *s / (norm + 1e-9_f32);
+        }
+
+        // d. Invoke self.ddc.process.
         self.ddc
-            .process(raw_iq, f_shift, self.sample_rate, &mut self.mixed_samples);
+            .process(&self.normalized_iq, f_shift, self.sample_rate, &mut self.mixed_samples);
 
         self.decimated_samples.clear();
         self.decimator
@@ -909,16 +934,36 @@ impl DemodChannel {
         let decimated_ts = self.decimator.decimation_factor as f64 / self.sample_rate;
 
         if has_signal {
+            let scale = if self.pll_tracker.modulation == Modulation::Bpsk { 2.0 } else { 1.0 };
             // EKF tracker initialization transitions
             let was_no_signal = self.last_snr < 0.0;
             if !self.pll_tracker.is_locked && (!self.ever_locked || was_no_signal) {
-                self.pll_tracker.reset(0.0, 0.0, 0.0);
+                let esprit_rate = self.sample_rate / self.decimator.decimation_factor as f64;
+                let chunk_size = (0.01 * esprit_rate).round() as usize;
+                let buffer_slice = if self.decimated_samples.len() >= chunk_size {
+                    &self.decimated_samples[..chunk_size]
+                } else {
+                    &self.decimated_samples
+                };
+
+                let init_freq_offset = if !buffer_slice.is_empty() {
+                    if self.pll_tracker.modulation == Modulation::Bpsk {
+                        let squared_slice: Vec<Complex<f32>> = buffer_slice.iter().map(|&s| s * s).collect();
+                        estimate_frequency_esprit(&squared_slice, esprit_rate, 10)
+                    } else {
+                        estimate_frequency_esprit(buffer_slice, esprit_rate, 10)
+                    }
+                } else {
+                    0.0
+                };
+
+                self.pll_tracker.reset(0.0, init_freq_offset, 0.0);
                 // Bootstrap bank trackers in lock-step: without this, bank trackers
                 // stay is_locked=false forever and their EKF update loop never runs.
                 if let Some(ref mut bank) = self.tracking_bank {
                     for t in &mut bank.trackers {
                         if !t.is_locked {
-                            t.reset(0.0, 0.0, 0.0);
+                            t.reset(0.0, init_freq_offset, 0.0);
                         }
                     }
                 }
@@ -934,7 +979,7 @@ impl DemodChannel {
 
                         if tracker.is_locked {
                             if (tracker.ts - decimated_ts).abs() > 1e-9 {
-                                let theta = tracker.x[0];
+                                let theta = tracker.x[0] / scale;
                                 let cos_theta = (-theta).cos();
                                 let sin_theta = (-theta).sin();
                                 let derotated_s = Complex::new(
@@ -947,7 +992,7 @@ impl DemodChannel {
                                 for (sym_derot, mu) in symbols.drain(..) {
                                     let dt_sample = decimated_ts;
                                     let true_theta =
-                                        theta - tracker.x[1] * (3.0 - mu as f64) * dt_sample;
+                                        theta - (tracker.x[1] / scale) * (3.0 - mu as f64) * dt_sample;
                                     let cos_inv = true_theta.cos();
                                     let sin_inv = true_theta.sin();
                                     let sym_raw = Complex::new(
@@ -983,11 +1028,11 @@ impl DemodChannel {
                 let obs = bank.compute_tracker_discrepancy();
                 if obs > 150.0 {
                     bank.terminated_in_fade = true;
-                    let f0 = bank.trackers[0].x[1] / (2.0 * std::f64::consts::PI);
+                    let f0 = (bank.trackers[0].x[1] / scale) / (2.0 * std::f64::consts::PI);
                     if bank.trackers[0].is_locked {
                         for i in 1..3 {
                             if bank.trackers[i].is_locked {
-                                let fi = bank.trackers[i].x[1] / (2.0 * std::f64::consts::PI);
+                                let fi = (bank.trackers[i].x[1] / scale) / (2.0 * std::f64::consts::PI);
                                 let dev = (fi - f0).abs();
                                 if dev > 150.0 {
                                     bank.trackers[i].is_locked = false;
@@ -996,8 +1041,8 @@ impl DemodChannel {
                             }
                         }
                     } else if bank.trackers[1].is_locked && bank.trackers[2].is_locked {
-                        let f1 = bank.trackers[1].x[1] / (2.0 * std::f64::consts::PI);
-                        let f2 = bank.trackers[2].x[1] / (2.0 * std::f64::consts::PI);
+                        let f1 = (bank.trackers[1].x[1] / scale) / (2.0 * std::f64::consts::PI);
+                        let f2 = (bank.trackers[2].x[1] / scale) / (2.0 * std::f64::consts::PI);
                         if (f1 - f2).abs() > 150.0 {
                             let prune_idx =
                                 if bank.trackers[1].lock_metric < bank.trackers[2].lock_metric {
@@ -1025,11 +1070,11 @@ impl DemodChannel {
                 if let Some(selected_i) = best_i {
                     bank.active_idx = Some(selected_i);
                     let active_tracker = &bank.trackers[selected_i];
-                    let ch_freq_offset = active_tracker.x[1] / (2.0 * std::f64::consts::PI);
+                    let ch_freq_offset = (active_tracker.x[1] / scale) / (2.0 * std::f64::consts::PI);
                     self.is_locked = true;
                     self.symbol_locked = true;
                     self.frequency = freq_to_use + ch_freq_offset;
-                    self.phase = active_tracker.x[0];
+                    self.phase = active_tracker.x[0] / scale;
                     bank.in_fade = false;
                     bank.fade_counter = 0;
                     self.ever_locked = true;
@@ -1048,11 +1093,11 @@ impl DemodChannel {
                             self.ever_locked = false;
                         } else {
                             let tracker = &bank.trackers[prev_i];
-                            let ch_freq_offset = tracker.x[1] / (2.0 * std::f64::consts::PI);
+                            let ch_freq_offset = (tracker.x[1] / scale) / (2.0 * std::f64::consts::PI);
                             self.is_locked = true;
                             self.symbol_locked = true;
                             self.frequency = freq_to_use + ch_freq_offset;
-                            self.phase = tracker.x[0];
+                            self.phase = tracker.x[0] / scale;
                         }
                     } else {
                         self.is_locked = false;
@@ -1068,7 +1113,7 @@ impl DemodChannel {
                 for &s in &self.decimated_samples {
                     if self.pll_tracker.is_locked {
                         if (self.pll_tracker.ts - decimated_ts).abs() > 1e-9 {
-                            let theta = self.pll_tracker.x[0];
+                            let theta = self.pll_tracker.x[0] / scale;
                             let cos_theta = (-theta).cos();
                             let sin_theta = (-theta).sin();
                             let derotated_s = Complex::new(
@@ -1081,7 +1126,7 @@ impl DemodChannel {
                             for (sym_derot, mu) in symbols.drain(..) {
                                 let dt_sample = decimated_ts;
                                 let true_theta =
-                                    theta - self.pll_tracker.x[1] * (3.0 - mu as f64) * dt_sample;
+                                    theta - (self.pll_tracker.x[1] / scale) * (3.0 - mu as f64) * dt_sample;
                                 let cos_inv = true_theta.cos();
                                 let sin_inv = true_theta.sin();
                                 let sym_raw = Complex::new(
@@ -1111,8 +1156,8 @@ impl DemodChannel {
                 self.is_locked = self.pll_tracker.is_locked;
                 self.symbol_locked = self.is_locked;
                 self.frequency =
-                    freq_to_use + (self.pll_tracker.x[1] / (2.0 * std::f64::consts::PI));
-                self.phase = self.pll_tracker.x[0];
+                    freq_to_use + ((self.pll_tracker.x[1] / scale) / (2.0 * std::f64::consts::PI));
+                self.phase = self.pll_tracker.x[0] / scale;
                 if self.is_locked {
                     self.ever_locked = true;
                 }
@@ -1210,3 +1255,51 @@ pub fn process_pipeline_parallel(
         channel.process_block_with_center(raw_iq, center_freq);
     });
 }
+
+pub fn estimate_frequency_esprit(samples: &[Complex<f32>], sample_rate: f64, m: usize) -> f64 {
+    let n = samples.len();
+    if n < m {
+        return 0.0;
+    }
+    let l = n - m + 1;
+    
+    let mut r_xx = nalgebra::DMatrix::<Complex<f64>>::zeros(m, m);
+    for i in 0..m {
+        for j in 0..m {
+            let mut sum = Complex::new(0.0f64, 0.0f64);
+            for k in 0..l {
+                let s_i = Complex::new(samples[k + m - 1 - i].re as f64, samples[k + m - 1 - i].im as f64);
+                let s_j = Complex::new(samples[k + m - 1 - j].re as f64, samples[k + m - 1 - j].im as f64);
+                sum += s_i * s_j.conj();
+            }
+            r_xx[(i, j)] = sum / (l as f64);
+        }
+    }
+
+    let mut u = nalgebra::DVector::<Complex<f64>>::from_element(m, Complex::new(1.0, 0.0));
+    for _ in 0..15 {
+        let w = &r_xx * &u;
+        let norm = w.norm();
+        if norm > 1e-12 {
+            u = w.map(|val| val / norm);
+        } else {
+            break;
+        }
+    }
+
+    let mut numerator = Complex::new(0.0f64, 0.0f64);
+    let mut denominator = 0.0f64;
+    for i in 0..(m - 1) {
+        numerator += u[i].conj() * u[i + 1];
+        denominator += u[i].norm_sqr();
+    }
+    
+    if denominator > 1e-12 {
+        let psi = numerator / denominator;
+        let angle = psi.im.atan2(psi.re);
+        -(angle * sample_rate) / (2.0 * std::f64::consts::PI)
+    } else {
+        0.0
+    }
+}
+

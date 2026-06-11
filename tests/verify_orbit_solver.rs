@@ -552,6 +552,8 @@ pub fn fit_orbit_doppler_grid_legacy(
         epoch,
         pass_dts,
         pass_dfs,
+        pass_df1s: Vec::new(),
+        pass_df2s: Vec::new(),
     })
 }
 
@@ -737,3 +739,170 @@ fn test_langevin_global_solver() {
         );
     }
 }
+
+#[test]
+fn test_virtual_tcxo_polynomial_fit() {
+    let truth_a = 6378137.0 + 550000.0; // 550 km altitude circular orbit
+    let truth_i = 53.0_f64.to_radians(); // 53 degrees inclination
+    let truth_raan = 1.2;
+    let truth_u0 = 0.5;
+    let center_freq = 150800000.0;
+
+    let epoch = DateTime::parse_from_rfc3339("2026-06-09T12:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    // Get the satellite ECEF position at epoch
+    let (pos_sat_epoch, _) =
+        orbit_solver::propagate_ecef(truth_a, truth_i, truth_raan, truth_u0, epoch, epoch);
+
+    // Convert satellite position at epoch to geodetic coordinates, and place the observer there
+    let (rec_lat, rec_lon, _) = orbit::ecef_to_wgs84(pos_sat_epoch);
+    let rec_alt = 0.0;
+    let rec_ecef = orbit::wgs84_to_ecef(rec_lat, rec_lon, rec_alt);
+
+    // Simulate passes when the range is < 2500 km
+    let mut passes = Vec::new();
+    let mut current_pass: Option<orbit_solver::RawPass> = None;
+    let mut last_t: Option<DateTime<Utc>> = None;
+
+    // Start propagating 1200 seconds before epoch to capture the full first pass
+    for step in -240..9600 {
+        let t = epoch + chrono::Duration::seconds((step as i64) * 5);
+        let (pos_sat, _) =
+            orbit_solver::propagate_ecef(truth_a, truth_i, truth_raan, truth_u0, epoch, t);
+        let dx = pos_sat[0] - rec_ecef[0];
+        let dy = pos_sat[1] - rec_ecef[1];
+        let dz = pos_sat[2] - rec_ecef[2];
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+
+        if dist < 2500000.0 {
+            let pred_shift = orbit_solver::predict_frequency(
+                truth_a,
+                truth_i,
+                truth_raan,
+                truth_u0,
+                epoch,
+                t,
+                0.0,
+                0.0,
+                center_freq,
+                rec_ecef,
+            );
+            let observed_freq = center_freq + pred_shift;
+
+            let point = orbit_solver::PassPoint {
+                time: t,
+                freq: observed_freq,
+            };
+
+            if let Some(ref mut pass) = current_pass {
+                if let Some(lt) = last_t {
+                    if (t - lt).num_seconds() > 300 {
+                        passes.push(current_pass.take().unwrap());
+                        current_pass = Some(orbit_solver::RawPass {
+                            sat_name: "SIM_SAT".to_string(),
+                            center_freq,
+                            points: vec![point],
+                        });
+                    } else {
+                        pass.points.push(point);
+                    }
+                }
+            } else {
+                current_pass = Some(orbit_solver::RawPass {
+                    sat_name: "SIM_SAT".to_string(),
+                    center_freq,
+                    points: vec![point],
+                });
+            }
+            last_t = Some(t);
+        }
+    }
+    if let Some(pass) = current_pass {
+        passes.push(pass);
+    }
+
+    assert!(
+        passes.len() >= 2,
+        "Need at least 2 simulated passes, got {}",
+        passes.len()
+    );
+
+    // Find the pair of passes that minimizes synodic period distortion
+    let mut best_pair = (0, 1);
+    let mut best_diff = f64::MAX;
+    for i in 0..passes.len() {
+        for j in i + 1..passes.len() {
+            let mut obs_pca_i = passes[i].points[0].time;
+            let mut min_off_i = f64::MAX;
+            for pt in &passes[i].points {
+                let off = (pt.freq - center_freq).abs();
+                if off < min_off_i {
+                    min_off_i = off;
+                    obs_pca_i = pt.time;
+                }
+            }
+            let mut obs_pca_j = passes[j].points[0].time;
+            let mut min_off_j = f64::MAX;
+            for pt in &passes[j].points {
+                let off = (pt.freq - center_freq).abs();
+                if off < min_off_j {
+                    min_off_j = off;
+                    obs_pca_j = pt.time;
+                }
+            }
+            let dt = (obs_pca_j - obs_pca_i).num_milliseconds() as f64 / 1000.0;
+            let k = (dt / 5700.0).round();
+            if k > 0.0 {
+                let dt_k = dt / k;
+                let diff = (dt_k - 5740.0).abs();
+                if diff < best_diff {
+                    best_diff = diff;
+                    best_pair = (i, j);
+                }
+            }
+        }
+    }
+
+    println!("DEBUG: Selected best pair of passes: {:?}", best_pair);
+    let mut selected_passes = vec![passes[best_pair.0].clone(), passes[best_pair.1].clone()];
+
+    // Inject second-order polynomial thermal drift offset:
+    // df(t) = 15.0 + 0.1 * tau - 0.0002 * tau^2
+    for pass in &mut selected_passes {
+        let t_ref = pass.points[0].time;
+        for pt in &mut pass.points {
+            let tau = (pt.time - t_ref).num_milliseconds() as f64 / 1000.0;
+            let drift = 15.0 + 0.1 * tau - 0.0002 * tau * tau;
+            pt.freq += drift;
+        }
+    }
+
+    // Fit circular orbit from simulated passes with polynomial drift
+    let initial_a = truth_a + 500.0; // close guess
+    let initial_i = truth_i + 0.01;
+
+    let solved = orbit_solver::fit_orbit_doppler(&selected_passes, rec_ecef, initial_a, initial_i)
+        .expect("Virtual TCXO Doppler orbit solver failed to converge");
+
+    println!("Solved orbit: a={:.1}, i={:.4}, raan0={:.4}, u0={:.4}", solved.a, solved.i, solved.raan0, solved.u0);
+    for idx in 0..2 {
+        println!(
+            "Pass {}: df0 = {:.4} Hz (target=15.0), df1 = {:.6} Hz/s (target=0.1), df2 = {:.8} Hz/s^2 (target=-0.0002)",
+            idx, solved.pass_dfs[idx], solved.pass_df1s[idx], solved.pass_df2s[idx]
+        );
+    }
+
+    // Verify solved parameters match the injected drift parameters
+    for idx in 0..2 {
+        let err_df0 = (solved.pass_dfs[idx] - 15.0).abs();
+        let err_df1 = (solved.pass_df1s[idx] - 0.1).abs();
+        let err_df2 = (solved.pass_df2s[idx] - (-0.0002)).abs();
+
+        assert!(err_df0 < 1.0, "Pass {} df0 error too high: {}", idx, err_df0);
+        assert!(err_df1 < 0.05, "Pass {} df1 error too high: {}", idx, err_df1);
+        assert!(err_df2 < 0.0001, "Pass {} df2 error too high: {}", idx, err_df2);
+    }
+}
+

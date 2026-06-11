@@ -323,3 +323,66 @@ fn test_dual_stage_lock_prevents_lock_flickering_during_brief_signal_fades() {
         "Without dual-stage lock, the tracker should unlock/flicker during the brief fade"
     );
 }
+
+#[test]
+fn test_bpsk_squaring_low_snr() {
+    let fs = 1000.0;
+    let target_freq = 20.0; // Doppler shift
+    let snr_db = -15.0;
+    let snr_lin = 10.0f64.powf(snr_db / 10.0);
+    
+    let noise_power = 1.0 / snr_lin;
+    let noise_std = (noise_power / 2.0).sqrt() as f32;
+    
+    let mut rng = SimpleRng::new(1337);
+    let mut samples = Vec::new();
+    
+    let samples_per_symbol = 10;
+    let mut current_symbol = 1.0f32;
+    
+    for n in 0..8000 {
+        if n % samples_per_symbol == 0 {
+            current_symbol = if rng.next_f32() > 0.5 { 1.0 } else { -1.0 };
+        }
+        let t = n as f64 / fs;
+        let phase = 2.0 * std::f64::consts::PI * target_freq * t;
+        let sig = Complex::new(
+            current_symbol * phase.cos() as f32,
+            current_symbol * phase.sin() as f32,
+        );
+        let (n_re, n_im) = rng.next_gaussian();
+        let noise = Complex::new(n_re * noise_std, n_im * noise_std);
+        samples.push(sig + noise);
+    }
+    
+    let mut tracker = CarrierPllEkf::new(fs, Modulation::Bpsk);
+    // Tune EKF parameters to be extremely stable (very narrow bandwidth):
+    tracker.q_phase = 1e-6;
+    tracker.q_freq = 1e-5;
+    tracker.q_chirp = 0.0;
+    tracker.r_meas = 10000.0;
+    
+    // Reset near twice the Doppler shift
+    tracker.reset(0.0, 2.0 * target_freq, 0.0);
+    tracker.p = nalgebra::Matrix3::zeros();
+    tracker.p[(0, 0)] = 1e-4;
+    tracker.p[(1, 1)] = 1e-4;
+    tracker.p[(2, 2)] = 1e-6;
+    tracker.convergence_guard = 8000; // Keep locked for the whole duration to allow averaging
+    
+    for sample in samples {
+        tracker.predict();
+        tracker.update(sample);
+    }
+    
+    let tracked_freq = tracker.x[1] / (2.0 * std::f64::consts::PI);
+    let freq_error = (tracked_freq - 2.0 * target_freq).abs();
+    
+    println!("Tracked frequency: {} Hz (expected {} Hz)", tracked_freq, 2.0 * target_freq);
+    println!("Frequency error: {} Hz", freq_error);
+    println!("Lock metric: {}", tracker.lock_metric);
+    println!("Is locked: {}", tracker.is_locked);
+    
+    assert!(tracker.is_locked, "Tracker should be locked");
+    assert!(freq_error < 1.5, "Frequency error should be less than 1.5 Hz");
+}

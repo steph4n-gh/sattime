@@ -20,6 +20,7 @@ pub struct LeodoLoop {
     pub last_status: String,
     pub synchronized: bool,
     pub pending_step_adjustment: Option<f64>,
+    pub shm_unit: Option<usize>,
 }
 
 impl LeodoLoop {
@@ -33,6 +34,7 @@ impl LeodoLoop {
             last_status: String::from("FREE_RUN"),
             synchronized: false,
             pending_step_adjustment: None,
+            shm_unit: None,
         }
     }
 }
@@ -89,6 +91,89 @@ pub fn perform_clock_step(target_adjustment: f64) -> Result<(), std::io::Error> 
 }
 
 #[cfg(target_family = "unix")]
+#[repr(C)]
+struct ShmTime {
+    mode: libc::c_int,
+    count: libc::c_int,
+    clock_time_stamp_sec: libc::time_t,
+    clock_time_stamp_usec: libc::c_int,
+    receive_time_stamp_sec: libc::time_t,
+    receive_time_stamp_usec: libc::c_int,
+    leap: libc::c_int,
+    precision: libc::c_int,
+    nsamples: libc::c_int,
+    valid: libc::c_int,
+    clock_time_stamp_nsec: libc::c_uint,
+    receive_time_stamp_nsec: libc::c_uint,
+    dummy: [libc::c_int; 8],
+}
+
+#[cfg(target_family = "unix")]
+fn write_to_ntp_shm(shm_unit: usize, target_adjustment: f64) -> Result<(), String> {
+    let key = 0x4e545030 + shm_unit as i32;
+    let size = std::mem::size_of::<ShmTime>();
+    let perms = if shm_unit >= 2 { 0o666 } else { 0o600 };
+    let shmid = unsafe { libc::shmget(key, size, perms | libc::IPC_CREAT) };
+    if shmid < 0 {
+        return Err(format!(
+            "shmget failed: {} (verify permissions or run as root/sudo for unit < 2)",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let shmaddr = unsafe { libc::shmat(shmid, std::ptr::null(), 0) };
+    if shmaddr == -1isize as *mut libc::c_void {
+        return Err(format!(
+            "shmat failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let shm_ptr = shmaddr as *mut ShmTime;
+    let receive_time = chrono::Utc::now();
+    let target_time = receive_time + chrono::Duration::microseconds((target_adjustment * 1_000_000.0) as i64);
+
+    let receive_sec = receive_time.timestamp() as libc::time_t;
+    let receive_usec = (receive_time.timestamp_subsec_micros() % 1_000_000) as libc::c_int;
+    let receive_nsec = receive_time.timestamp_subsec_nanos() as libc::c_uint;
+
+    let clock_sec = target_time.timestamp() as libc::time_t;
+    let clock_usec = (target_time.timestamp_subsec_micros() % 1_000_000) as libc::c_int;
+    let clock_nsec = target_time.timestamp_subsec_nanos() as libc::c_uint;
+
+    unsafe {
+        std::ptr::write_volatile(&mut (*shm_ptr).mode, 1);
+        std::ptr::write_volatile(&mut (*shm_ptr).valid, 0);
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+
+        let count = std::ptr::read_volatile(&(*shm_ptr).count);
+        std::ptr::write_volatile(&mut (*shm_ptr).count, count.wrapping_add(1));
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+
+        std::ptr::write_volatile(&mut (*shm_ptr).clock_time_stamp_sec, clock_sec);
+        std::ptr::write_volatile(&mut (*shm_ptr).clock_time_stamp_usec, clock_usec);
+        std::ptr::write_volatile(&mut (*shm_ptr).clock_time_stamp_nsec, clock_nsec);
+        std::ptr::write_volatile(&mut (*shm_ptr).receive_time_stamp_sec, receive_sec);
+        std::ptr::write_volatile(&mut (*shm_ptr).receive_time_stamp_usec, receive_usec);
+        std::ptr::write_volatile(&mut (*shm_ptr).receive_time_stamp_nsec, receive_nsec);
+        std::ptr::write_volatile(&mut (*shm_ptr).leap, 0);
+        std::ptr::write_volatile(&mut (*shm_ptr).precision, -20);
+        std::ptr::write_volatile(&mut (*shm_ptr).nsamples, 1);
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+
+        std::ptr::write_volatile(&mut (*shm_ptr).count, count.wrapping_add(2));
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+
+        std::ptr::write_volatile(&mut (*shm_ptr).valid, 1);
+    }
+    if unsafe { libc::shmdt(shmaddr) } < 0 {
+        return Err(format!(
+            "shmdt failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
 pub fn steer_system_clock(
     offset_seconds: f64,
     lo_bias: f64,
@@ -122,8 +207,27 @@ pub fn steer_system_clock(
     let mut actual_slewed = 0.0;
 
     if enable_steering {
-        // Step-once on the first synchronization event if offset > 100 ms
-        if !leodo_loop.synchronized && target_adjustment.abs() > 0.1 {
+        if let Some(shm_unit) = leodo_loop.shm_unit {
+            match write_to_ntp_shm(shm_unit, target_adjustment) {
+                Ok(_) => {
+                    status_str = format!("SUCCESS_SHM (NTP{})", shm_unit);
+                    msgs.push(format!(
+                        "[LEODO] Successfully wrote clock offset of {:.6}s to NTP SHM segment NTP{}",
+                        target_adjustment, shm_unit
+                    ));
+                    leodo_loop.synchronized = true;
+                    leodo_loop.last_update = Some(now);
+                }
+                Err(err) => {
+                    status_str = format!("ERROR_SHM: {}", err);
+                    msgs.push(format!(
+                        "[LEODO] Failed to write to NTP SHM segment NTP{}: {}",
+                        shm_unit, err
+                    ));
+                }
+            }
+        } else if !leodo_loop.synchronized && target_adjustment.abs() > 0.1 {
+            // Step-once on the first synchronization event if offset > 100 ms
             match perform_clock_step(target_adjustment) {
                 Ok(_) => {
                     actual_slewed = target_adjustment;
@@ -214,11 +318,19 @@ pub fn steer_system_clock(
             }
         }
     } else {
-        status_str = format!("DRY RUN (calculated {:.6}s adjustment)", target_adjustment);
-        msgs.push(format!(
-            "[LEODO] Dry run: Time offset {:.6}s, EKF phase offset {:.6}s, drift {:.3} PPM",
-            offset_seconds, target_adjustment, leodo_loop.clock_ekf.x[1]
-        ));
+        if let Some(shm_unit) = leodo_loop.shm_unit {
+            status_str = format!("DRY RUN SHM (NTP{})", shm_unit);
+            msgs.push(format!(
+                "[LEODO] Dry run (SHM NTP{}): Time offset {:.6}s, EKF phase offset {:.6}s, drift {:.3} PPM",
+                shm_unit, offset_seconds, target_adjustment, leodo_loop.clock_ekf.x[1]
+            ));
+        } else {
+            status_str = format!("DRY RUN (calculated {:.6}s adjustment)", target_adjustment);
+            msgs.push(format!(
+                "[LEODO] Dry run: Time offset {:.6}s, EKF phase offset {:.6}s, drift {:.3} PPM",
+                offset_seconds, target_adjustment, leodo_loop.clock_ekf.x[1]
+            ));
+        }
 
         leodo_loop.synchronized = true;
         leodo_loop.last_update = Some(now);
@@ -265,7 +377,6 @@ pub fn steer_system_clock(
     enable_steering: bool,
     leodo_loop: &mut LeodoLoop,
 ) -> Vec<String> {
-    let mut msgs = vec!["[LEODO] Clock steering is not supported on this platform.".to_string()];
     let now = chrono::Utc::now();
     let dt = if let Some(last) = leodo_loop.last_update {
         (now - last).num_milliseconds() as f64 / 1000.0
@@ -286,7 +397,15 @@ pub fn steer_system_clock(
     leodo_loop.last_offset = offset_seconds;
     leodo_loop.last_freq_err_ppm = leodo_loop.clock_ekf.x[1];
     leodo_loop.last_target_adjustment = target_adjustment;
-    leodo_loop.last_status = format!("NOT_SUPPORTED (dry EKF target: {:.6}s)", target_adjustment);
+
+    let mut msgs = Vec::new();
+    if leodo_loop.shm_unit.is_some() {
+        msgs.push("[LEODO] NTP SHM steering is not supported on this platform.".to_string());
+        leodo_loop.last_status = "NOT_SUPPORTED (SHM)".to_string();
+    } else {
+        msgs.push("[LEODO] Clock steering is not supported on this platform.".to_string());
+        leodo_loop.last_status = format!("NOT_SUPPORTED (dry EKF target: {:.6}s)", target_adjustment);
+    }
     msgs
 }
 
