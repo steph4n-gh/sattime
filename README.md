@@ -39,6 +39,15 @@
 
 ## Running Instructions
 
+### First-Time Use & Observer Position Kickstart
+On first-time execution, `sattime` defaults to Washington D.C. coordinates (`38.889931`, `-77.009003`, `25.0`) to schedule passes and initialize the tracking filters. If starting offline with no prior position data, the background geodetic solver will automatically converge on your true location after a few satellite passes.
+
+To **kickstart the system** and bypass this initial search, you can manually supply your approximate local GPS coordinates (latitude, longitude, and altitude in meters) using the `--lat`, `--lon`, and `--alt` command-line flags. This aligns the pass planner and EKF tracking loops with your local horizon immediately:
+
+```bash
+cargo run --release -- --sdr "driver=rtlsdr" --lat 39.02508 --lon -77.15115 --alt 87.0
+```
+
 ### 1. Live SDR Mode
 Stream samples directly from a connected RTL-SDR receiver to track satellites in real time:
 ```bash
