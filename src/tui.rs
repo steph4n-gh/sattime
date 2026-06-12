@@ -381,8 +381,12 @@ impl TuiManager {
                 "WARM UP"
             };
 
+            let est_utc = chrono::Utc::now() - chrono::Duration::microseconds((leodo_stats.0 * 1_000_000.0) as i64);
+            let est_utc_str = est_utc.format("%H:%M:%S.%3f UTC").to_string();
+
             let ntp_rows = vec![
                 Row::new(vec![Cell::from("Loop State"), Cell::from(loop_state)]).style(Style::default().fg(if args.leodo { Color::Green } else { Color::Yellow })),
+                Row::new(vec![Cell::from("Estimated UTC"), Cell::from(est_utc_str)]).style(Style::default().fg(Color::Cyan)),
                 Row::new(vec![Cell::from("Offset (dt)"), Cell::from(format!("{:+.6} s", leodo_stats.0))]),
                 Row::new(vec![Cell::from("Drift (df)"), Cell::from(format!("{:+.3} PPM", leodo_stats.1))]),
                 Row::new(vec![Cell::from("Slew Sched"), Cell::from(format!("{:+.6} s", leodo_stats.2))]),
