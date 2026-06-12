@@ -597,7 +597,13 @@ fn main() {
     unsafe {
         std::env::set_var("SOAPY_SDR_LOG_LEVEL", "WARNING");
     }
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // Automatically session-timestamp the default "passes" directory to give a fresh slate on every run
+    if args.output_dir == "passes" {
+        let session_timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+        args.output_dir = format!("passes/session_{}", session_timestamp);
+    }
 
     if let Ok(mut loop_lock) = get_leodo_loop().lock() {
         loop_lock.shm_unit = args.leodo_shm;
