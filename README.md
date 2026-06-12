@@ -1,6 +1,6 @@
 # `sattime`: LEO Satellite Tracking Receiver & Time Server
 
-![sattime TUI Screenshot](docs/sattime_screenshot.jpg)
+![sattime TUI Screenshot](docs/sattime_screenshot.png)
 
 `sattime` is a high-performance, Rust-based Software Defined Radio (SDR) carrier-tracking receiver and satellite-disciplined time server daemon. Designed for Low Earth Orbit (LEO) satellite constellations (e.g., Starlink, NOAA, Orbcomm, Iridium), the system uses passive Doppler oscillometry to achieve relative positioning and millisecond-level local system clock synchronization—completely offline, without requiring a commercial internet connection.
 
