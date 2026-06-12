@@ -28,8 +28,21 @@ use rustfft::FftPlanner;
 use sgp4::Elements;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
+
+const CHANNEL_COLORS: [Color; 8] = [
+    Color::Yellow,
+    Color::LightMagenta,
+    Color::Cyan,
+    Color::LightGreen,
+    Color::LightRed,
+    Color::LightBlue,
+    Color::LightYellow,
+    Color::White,
+];
+
 pub struct TuiState {
     pub history_offsets: VecDeque<(f64, f64)>,
+    pub channel_histories: Vec<VecDeque<(f64, f64)>>,
     pub spectrum: Vec<f32>,
     pub was_locked: bool,
     pub active_sat_trail: VecDeque<(f64, f64)>,
@@ -169,6 +182,7 @@ impl TuiManager {
             },
             state: TuiState {
                 history_offsets: VecDeque::with_capacity(350),
+                channel_histories: Vec::new(),
                 spectrum: vec![0.0f32; fft_size],
                 was_locked: false,
                 active_sat_trail: VecDeque::with_capacity(20),
@@ -215,7 +229,7 @@ impl TuiManager {
     pub fn draw(
         &mut self,
         state_name: &str,
-        _elapsed_seconds: f64,
+        elapsed_seconds: f64,
         tracked_peak: f64,
         freq_offset: f64,
         doppler_rate: f64,
@@ -246,6 +260,26 @@ impl TuiManager {
             let _ = std::io::stdout().flush();
         }
         self.state.was_locked = is_locked;
+
+        // Update historical trajectories for all channels
+        if self.state.channel_histories.len() < channels.len() {
+            self.state.channel_histories.resize_with(channels.len(), || VecDeque::with_capacity(350));
+        }
+        for ch in channels {
+            let ch_idx = ch.id;
+            if ch_idx >= self.state.channel_histories.len() {
+                self.state.channel_histories.resize_with(ch_idx + 1, || VecDeque::with_capacity(350));
+            }
+            let history = &mut self.state.channel_histories[ch_idx];
+            if ch.status != "IDLE" {
+                history.push_back((elapsed_seconds, ch.freq_offset));
+            } else {
+                history.clear();
+            }
+            if history.len() > 300 {
+                history.pop_front();
+            }
+        }
 
         if let Some(rx) = &self.log_rx {
             while let Ok(msg) = rx.try_recv() {
@@ -483,33 +517,90 @@ impl TuiManager {
                 ].as_ref())
                 .split(visuals_chunks[1]);
 
-            let points: Vec<(f64, f64)> = state.history_offsets.iter().copied().collect();
-            let dataset = Dataset::default()
-                .name("Doppler Drift")
-                .marker(symbols::Marker::Braille)
-                .style(Style::default().fg(Color::Yellow))
-                .data(&points);
+            // Convert channel histories to vectors of points for rendering
+            let mut channel_points: Vec<Vec<(f64, f64)>> = Vec::new();
+            for ch_idx in 0..state.channel_histories.len() {
+                let history = &state.channel_histories[ch_idx];
+                channel_points.push(history.iter().copied().collect());
+            }
 
-            let x_max = if !points.is_empty() { points.last().unwrap().0 } else { 0.0 };
-            let x_min = if points.len() >= 300 { points[0].0 } else { 0.0 };
-
-            // Dynamic Y-axis auto-scaling to show fine frequency detail
+            let mut x_min = f64::MAX;
+            let mut x_max = f64::MIN;
             let mut y_min = -100.0;
             let mut y_max = 100.0;
-            if !points.is_empty() {
-                let mut min_val = f64::MAX;
-                let mut max_val = f64::MIN;
-                for &(_, val) in &points {
-                    if val < min_val { min_val = val; }
-                    if val > max_val { max_val = val; }
+            let mut has_points = false;
+            let mut min_val = f64::MAX;
+            let mut max_val = f64::MIN;
+
+            for pts in &channel_points {
+                if !pts.is_empty() {
+                    has_points = true;
+                    for &(x, val) in pts {
+                        if x < x_min { x_min = x; }
+                        if x > x_max { x_max = x; }
+                        if val < min_val { min_val = val; }
+                        if val > max_val { max_val = val; }
+                    }
                 }
+            }
+
+            if has_points {
                 let range = max_val - min_val;
                 let margin = (range * 0.15).max(20.0); // 15% margin or at least 20 Hz
                 y_min = min_val - margin;
                 y_max = max_val + margin;
+                if x_min >= x_max {
+                    x_max = x_min + 1.0;
+                }
+            } else {
+                // Fallback to legacy single-channel history_offsets if no multi-channel lock exists
+                let points: Vec<(f64, f64)> = state.history_offsets.iter().copied().collect();
+                if !points.is_empty() {
+                    has_points = true;
+                    x_max = points.last().unwrap().0;
+                    x_min = if points.len() >= 300 { points[0].0 } else { 0.0 };
+                    for &(_, val) in &points {
+                        if val < min_val { min_val = val; }
+                        if val > max_val { max_val = val; }
+                    }
+                    let range = max_val - min_val;
+                    let margin = (range * 0.15).max(20.0);
+                    y_min = min_val - margin;
+                    y_max = max_val + margin;
+                } else {
+                    x_min = 0.0;
+                    x_max = 1.0;
+                }
             }
 
-            let chart = Chart::new(vec![dataset])
+            let mut datasets = Vec::new();
+            if has_points && !channel_points.is_empty() {
+                for ch in channels {
+                    let ch_idx = ch.id;
+                    if ch_idx < channel_points.len() && !channel_points[ch_idx].is_empty() {
+                        let color = CHANNEL_COLORS[ch_idx % CHANNEL_COLORS.len()];
+                        let dataset = Dataset::default()
+                            .name(format!("Ch {} ({})", ch.id, if ch.sat_name.is_empty() { "---" } else { &ch.sat_name }))
+                            .marker(symbols::Marker::Braille)
+                            .style(Style::default().fg(color))
+                            .data(&channel_points[ch_idx]);
+                        datasets.push(dataset);
+                    }
+                }
+            }
+
+            // Fallback dataset if empty
+            let fallback_points: Vec<(f64, f64)> = state.history_offsets.iter().copied().collect();
+            if datasets.is_empty() {
+                let dataset = Dataset::default()
+                    .name("Doppler Drift")
+                    .marker(symbols::Marker::Braille)
+                    .style(Style::default().fg(Color::Yellow))
+                    .data(&fallback_points);
+                datasets.push(dataset);
+            }
+
+            let chart = Chart::new(datasets)
                 .block(Block::default().borders(Borders::ALL).title(" Doppler S-Curve Plot (Hz Offset over Time) "))
                 .x_axis(Axis::default()
                     .title("Time (seconds)")
@@ -535,8 +626,11 @@ impl TuiManager {
                     _ => Style::default().fg(Color::DarkGray),
                 };
 
+                let ch_color = CHANNEL_COLORS[ch.id % CHANNEL_COLORS.len()];
+                let ch_style = Style::default().fg(ch_color).add_modifier(Modifier::BOLD);
+
                 let row = Row::new(vec![
-                    Cell::from(format!("Ch {}", ch.id)),
+                    Cell::from(format!("Ch {}", ch.id)).style(ch_style),
                     Cell::from(if ch.sat_name.is_empty() { "---".to_string() } else { ch.sat_name.clone() }),
                     Cell::from(ch.status.clone()).style(status_style),
                     Cell::from(if ch.status == "IDLE" { "---".to_string() } else { format!("{:.3} MHz", ch.target_freq / 1e6) }),
