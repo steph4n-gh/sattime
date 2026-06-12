@@ -1731,6 +1731,9 @@ pub fn save_pass_data(
     use std::fs::File;
     use std::io::Write;
 
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut file = File::create(path)?;
     writeln!(file, "# satellite_name: {}", sat_name)?;
     writeln!(file, "# center_frequency: {}", center_freq)?;
