@@ -172,9 +172,9 @@ pub struct Args {
     #[arg(long = "no-notch-spurs")]
     no_notch_spurs: bool,
 
-    /// Enable Extensive Cancellation Algorithm (ECA) clutter filter on channels
-    #[arg(long = "eca")]
-    eca: bool,
+    /// Disable Extensive Cancellation Algorithm (ECA) clutter filter on channels (on by default)
+    #[arg(long = "no-eca")]
+    no_eca: bool,
 
     /// Disable real-time visual Terminal UI (TUI) dashboard (on by default)
     #[arg(long = "no-tui")]
@@ -1705,7 +1705,7 @@ fn main() {
             args.fade_timeout,
             taps.clone(),
             decimate,
-            args.eca,
+            !args.no_eca,
         ));
     }
 

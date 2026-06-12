@@ -172,7 +172,7 @@ To synchronize fractional sample boundaries and recover the precise symbol timin
   This ensures phase-coherence for the EKF tracking update step.
 
 ### 1.6 Extensive Cancellation Algorithm (ECA)
-For environments with significant multipath propagation or transmitter local oscillator leakage, the receiver provides an option (`--eca` command line flag) to replace basic block mean subtraction with the Extensive Cancellation Algorithm (ECA).
+For environments with significant multipath propagation or transmitter local oscillator leakage, the receiver enables the Extensive Cancellation Algorithm (ECA) by default to replace basic block mean subtraction. It can be disabled using the `--no-eca` command line flag.
 
 ECA models the static clutter and direct-path leakage as a projection onto a delay-history subspace. Let $\mathbf{x} = [x[0], \dots, x[N-1]]^T$ be the input block of surveillance samples, and let $\mathbf{x}_{ext} = [\mathbf{h}_{old}; \mathbf{x}]$ be the input block extended by 6 historical samples to guarantee filter continuity. The delay-history matrix $\mathbf{B}$ of size $N \times 6$ is defined as:
 $$\mathbf{B}_{i, j} = x_{ext}[5 + i - j], \quad i \in \{0, \dots, N-1\}, \, j \in \{0, \dots, 5\}$$

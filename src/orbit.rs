@@ -1651,11 +1651,67 @@ pub fn fit_satellite(
         }
     }
 
+    // Microsecond-level refinement (10 microsecond steps over a +/- 1 ms window)
+    let mut micro_min_rmse = refined_min_rmse;
+    let mut micro_best_delta_t = refined_best_delta_t;
+    let mut micro_best_freq_offset = refined_best_freq_offset;
+
     if refined_min_rmse < f64::MAX {
+        let micro_steps = 200;
+        let start_t = refined_best_delta_t - 0.001;
+        for step in 0..=micro_steps {
+            let delta_t = start_t + (step as f64) * 0.00001;
+            let mut y = Vec::with_capacity(data.len());
+
+            for (idx, &(dt, freq_meas)) in data.iter().enumerate() {
+                if let Some((pos_teme, vel_teme)) = precomputed_states[idx] {
+                    let pos_teme_true = [
+                        pos_teme[0] - delta_t * vel_teme[0],
+                        pos_teme[1] - delta_t * vel_teme[1],
+                        pos_teme[2] - delta_t * vel_teme[2],
+                    ];
+                    let dt_true = dt - chrono::Duration::microseconds((delta_t * 1e6) as i64);
+                    let jd = datetime_to_jd(dt_true);
+                    let (pos_sat, vel_sat) = teme_to_ecef(jd, pos_teme_true, vel_teme);
+
+                    let rx = pos_sat[0] - pos_obs[0];
+                    let ry = pos_sat[1] - pos_obs[1];
+                    let rz = pos_sat[2] - pos_obs[2];
+                    let range = (rx * rx + ry * ry + rz * rz).sqrt();
+                    let range_rate = (rx * vel_sat[0] + ry * vel_sat[1] + rz * vel_sat[2]) / range;
+                    let doppler_term = 1.0 - range_rate / 299792458.0;
+
+                    y.push(freq_meas - center_freq * doppler_term);
+                }
+            }
+
+            if y.len() > data.len() / 2 {
+                let sum: f64 = y.iter().sum();
+                let count = y.len() as f64;
+                let df0 = sum / count;
+                let sq_sum: f64 = y
+                    .iter()
+                    .map(|&val| {
+                        let diff = val - df0;
+                        diff * diff
+                    })
+                    .sum();
+                let rmse = (sq_sum / count).sqrt();
+
+                if rmse < micro_min_rmse {
+                    micro_min_rmse = rmse;
+                    micro_best_delta_t = delta_t;
+                    micro_best_freq_offset = df0;
+                }
+            }
+        }
+    }
+
+    if micro_min_rmse < f64::MAX {
         Some((
-            refined_best_delta_t,
-            refined_best_freq_offset,
-            refined_min_rmse,
+            micro_best_delta_t,
+            micro_best_freq_offset,
+            micro_min_rmse,
         ))
     } else {
         None

@@ -281,7 +281,7 @@ pub fn steer_system_clock(
             // unsafe block to call the native OS API
             let ret = unsafe { libc::adjtime(&delta, &mut old_delta) };
             if ret == 0 {
-                actual_slewed = 0.0; // Audit Fix S5/S6: adjtime is gradual, no instant step occurred
+                actual_slewed = target_adjustment; // Slew will be completed by the next sparse EKF pass update, feeding back the control input
                 status_str = format!("SUCCESS_SLEW (target {:.6}s)", target_adjustment);
                 msgs.push(format!(
                     "[LEODO] Successfully requested OS clock slew of {:.6}s",
