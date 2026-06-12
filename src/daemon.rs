@@ -171,7 +171,7 @@ fn write_to_ntp_shm(shm_unit: usize, target_adjustment: f64) -> Result<(), Strin
 #[cfg(target_family = "unix")]
 pub fn steer_system_clock(
     offset_seconds: f64,
-    lo_bias: f64,
+    _lo_bias: f64,
     center_freq: f64,
     log_path: &str,
     enable_steering: bool,
@@ -197,9 +197,6 @@ pub fn steer_system_clock(
     // Apply control feedback portion of the slew to EKF state BEFORE predict/update
     leodo_loop.clock_ekf.x[0] -= completed_slew;
 
-    // Calculate frequency error in PPM
-    let freq_err_ppm = (lo_bias / center_freq) * 1_000_000.0;
-
     // Update EKF & PI loop
     let dt = if let Some(last) = leodo_loop.last_update {
         (now - last).num_milliseconds() as f64 / 1000.0
@@ -210,7 +207,7 @@ pub fn steer_system_clock(
     if dt > 0.0 {
         leodo_loop.clock_ekf.predict(dt);
     }
-    leodo_loop.clock_ekf.update(offset_seconds, freq_err_ppm);
+    leodo_loop.clock_ekf.update_1d(offset_seconds);
 
     // Compute the target adjustment from the EKF phase offset
     let target_adjustment = leodo_loop.clock_ekf.x[0];
@@ -389,8 +386,8 @@ pub fn steer_system_clock(
 #[cfg(not(target_family = "unix"))]
 pub fn steer_system_clock(
     offset_seconds: f64,
-    lo_bias: f64,
-    center_freq: f64,
+    _lo_bias: f64,
+    _center_freq: f64,
     log_path: &str,
     enable_steering: bool,
     leodo_loop: &mut LeodoLoop,
@@ -403,12 +400,10 @@ pub fn steer_system_clock(
     };
     leodo_loop.last_update = Some(now);
 
-    let freq_err_ppm = (lo_bias / center_freq) * 1_000_000.0;
-
     if dt > 0.0 {
         leodo_loop.clock_ekf.predict(dt);
     }
-    leodo_loop.clock_ekf.update(offset_seconds, freq_err_ppm);
+    leodo_loop.clock_ekf.update_1d(offset_seconds);
 
     let target_adjustment = leodo_loop.clock_ekf.x[0];
     leodo_loop.synchronized = true;

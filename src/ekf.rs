@@ -19,7 +19,7 @@ impl ClockEkf {
             p: Matrix2::new(1e-4, 0.0, 0.0, 1e-2), // 10ms phase variance, 0.1 PPM freq variance
             q_phase: 1e-12,                        // phase noise (s^2 / s)
             q_freq: 1e-14,                         // frequency walk noise (PPM^2 / s)
-            r_meas: 1e-8,                          // measurement noise (s^2)
+            r_meas: 1e-10,                         // measurement noise (s^2), optimized for microsecond-level fits
             r_freq: 1e-4,
         }
     }
@@ -35,6 +35,23 @@ impl ClockEkf {
 
         self.x = f * self.x;
         self.p = f * self.p * f.transpose() + q;
+    }
+
+    pub fn update_1d(&mut self, z_offset: f64) {
+        let y = z_offset - self.x[0];
+        let s = self.p[(0, 0)] + self.r_meas;
+        if s.abs() >= 1e-12 {
+            let k = self.p.column(0) / s;
+            self.x += k * y;
+            let k0 = k[0];
+            let k1 = k[1];
+            let a = Matrix2::new(1.0 - k0, 0.0, -k1, 1.0);
+            self.p = a * self.p * a.transpose();
+            self.p[(0, 0)] += k0 * k0 * self.r_meas;
+            self.p[(0, 1)] += k0 * k1 * self.r_meas;
+            self.p[(1, 0)] += k1 * k0 * self.r_meas;
+            self.p[(1, 1)] += k1 * k1 * self.r_meas;
+        }
     }
 
     pub fn update(&mut self, z_offset: f64, z_freq_ppm: f64) {
