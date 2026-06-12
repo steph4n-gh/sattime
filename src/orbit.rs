@@ -1441,10 +1441,10 @@ pub fn find_pca_time(
     let epoch_dt = elements.datetime.and_utc();
     let target_mins = (around_time - epoch_dt).num_milliseconds() as f64 / 60000.0;
 
-    // 1. Grid search in minutes from target_mins - 180.0 to target_mins + 180.0
-    let steps = 360;
+    // 1. Grid search in minutes from target_mins - 50.0 to target_mins + 50.0
+    let steps = 100;
     for step in 0..=steps {
-        let mins = target_mins - 180.0 + (step as f64);
+        let mins = target_mins - 50.0 + (step as f64);
         if let Ok(prediction) = constants.propagate(sgp4::MinutesSinceEpoch(mins)) {
             let pos_teme = [
                 prediction.position[0] * 1000.0,
