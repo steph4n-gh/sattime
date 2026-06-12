@@ -64,12 +64,15 @@ To reduce CPU load and isolate the VHF Doppler shift band ($\approx \pm 20\text{
   ```rust
   struct FirDecimator {
       taps: Vec<f32>,
+      taps_simd: Vec<f32>,
       decimation_factor: usize,
       history: Vec<Complex<f32>>, // Stores N-1 samples of historical overlap state
       pending_offset: usize,
   }
   ```
   The `process` function computes the discrete convolution of the input stream with the filter taps, retaining fractional index step offsets between input buffers to prevent phase discontinuities.
+
+  To lower CPU consumption during high-sample-rate ingestion, the convolution inner loop is vectorized using platform-specific SIMD instructions (AVX2/FMA on x86_64, Neon on AArch64) when supported, and falls back to a pointer-based scalar implementation otherwise. The `taps_simd` vector stores duplicated coefficients (`[t0, t0, t1, t1, ...]`) to process real and imaginary components of the complex stream concurrently.
 
 ### 1.3 FFT Peak-Search Tracking
 - **FFT Resolution**: The decimated stream is processed in windows of length $N_{FFT}$ (power of two, e.g. $32768$ or $1024$) using `rustfft`.
@@ -167,6 +170,29 @@ To synchronize fractional sample boundaries and recover the precise symbol timin
   The phase of the numerically controlled oscillator (NCO) in the PLL-EKF must be adjusted to account for the fractional timing delay introduced by the interpolator. When a symbol is yielded by the Gardner loop, its corresponding local oscillator reference phase is retroactively adjusted by the sub-sample delay offset:
   $$\theta_{true} = \theta - \omega \cdot (3.0 - \mu) \cdot \Delta t$$
   This ensures phase-coherence for the EKF tracking update step.
+
+### 1.6 Extensive Cancellation Algorithm (ECA)
+For environments with significant multipath propagation or transmitter local oscillator leakage, the receiver provides an option (`--eca` command line flag) to replace basic block mean subtraction with the Extensive Cancellation Algorithm (ECA).
+
+ECA models the static clutter and direct-path leakage as a projection onto a delay-history subspace. Let $\mathbf{x} = [x[0], \dots, x[N-1]]^T$ be the input block of surveillance samples, and let $\mathbf{x}_{ext} = [\mathbf{h}_{old}; \mathbf{x}]$ be the input block extended by 6 historical samples to guarantee filter continuity. The delay-history matrix $\mathbf{B}$ of size $N \times 6$ is defined as:
+$$\mathbf{B}_{i, j} = x_{ext}[5 + i - j], \quad i \in \{0, \dots, N-1\}, \, j \in \{0, \dots, 5\}$$
+
+The projection weights $\mathbf{w}$ are obtained by solving the regularized least-squares problem:
+$$(\mathbf{B}^H \mathbf{B} + \tau \mathbf{I}) \mathbf{w} = \mathbf{B}^H \mathbf{x}$$
+where:
+- $\mathbf{B}^H \mathbf{B}$ is the $6 \times 6$ covariance matrix of the clutter subspace.
+- $\tau = 1e^{-3} \cdot N$ is a Tikhonov regularization factor (ridge regression) that prevents the filter from achieving "perfect" cancellation of the moving target signals.
+- $\mathbf{I}$ is the identity matrix.
+
+To minimize latency, the correlation matrix $\mathbf{R} = \mathbf{B}^H \mathbf{B}$ is computed efficiently:
+1. The first row $\mathbf{R}_{0, d}$ is evaluated directly in $O(N)$ operations:
+   $$\mathbf{R}_{0, d} = \sum_{i=0}^{N-1} x_{ext}[5 + i]^* x_{ext}[5 + i - d], \quad d \in \{0, \dots, 5\}$$
+2. The remaining rows are updated in $O(1)$ operations via a sliding window:
+   $$\mathbf{R}_{j, j+d} = \mathbf{R}_{j-1, j-1+d} + x_{ext}[5 - j]^* x_{ext}[5 - j - d] - x_{ext}[5 - j + N]^* x_{ext}[5 - j + N - d]$$
+3. The lower triangle of $\mathbf{R}$ is filled via Hermitian symmetry: $\mathbf{R}_{k, j} = \mathbf{R}_{j, k}^*$.
+
+The $6 \times 6$ system is solved using Cholesky decomposition ($\mathbf{R} + \tau \mathbf{I} = \mathbf{L} \mathbf{L}^H$) followed by forward and backward substitution. The clutter-suppressed output block is then:
+$$\mathbf{y} = \mathbf{x} - \mathbf{B} \mathbf{w}$$
 
 ---
 
@@ -587,6 +613,8 @@ where:
 - $x_i$ is the spectral magnitude at bin $i$.
 - $v(d) = \text{trailing\_zeros}(d)$ is the 2-adic valuation of the bin index distance $d = |i - j|$.
 - The exponent $1.5$ acts as a fractional derivative scaling factor.
+
+To optimize computation and avoid calling the transcendental `powf()` function in the inner $O(N)$ loop, the 2-adic weights $2^{1.5 \cdot v(d)}$ are cached in a static lookup array `ADIC_WEIGHTS: [f64; 32]` initialized once at runtime using `std::sync::OnceLock`. The valuation $v(d)$ is retrieved via a single CPU instruction (trailing zeros count) and indexed directly into the weight table.
 
 A bin $i$ is detected as a spur if it exceeds the local background level and satisfies:
 $$\text{sum\_deriv}_i > 10.0 \cdot M_{med}$$
