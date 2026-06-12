@@ -233,7 +233,7 @@ fn run_single_stress_test(config: &StressTestConfig) -> Result<(f64, f64, f64, f
             let err_a = (solved.a - truth_a).abs();
             let err_i = (solved.i - truth_i).abs().to_degrees();
             let err_raan = (solved.raan0 - truth_raan).abs().to_degrees();
-            let err_u0 = (solved.u0 - truth_u0).abs().to_degrees();
+            let _err_u0 = (solved.u0 - truth_u0).abs().to_degrees();
             Ok((err_a, err_i, err_raan, duration))
         }
         Err(e) => Err(e.to_string()),
@@ -425,7 +425,7 @@ fn test_langevin_stress_suite() {
     let mut successes = 0;
     for tc in &test_cases {
         match run_single_stress_test(tc) {
-            Ok((err_a, err_i, err_raan, duration)) => {
+            Ok((err_a, err_i, _err_raan, duration)) => {
                 let converged = err_a < 500.0 && err_i < 0.1;
                 let status = if converged { "CONVERGED" } else { "FAILED" };
                 if converged {

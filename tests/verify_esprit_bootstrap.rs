@@ -57,6 +57,7 @@ fn test_esprit_bootstrap_bpsk() {
         5.0,
         taps,
         4, // decimate_factor
+        false, // eca_enabled
     );
     channel.nominal_freq = nominal_freq;
     channel.sample_rate = sample_rate;

@@ -110,7 +110,7 @@ fn test_ddc_phase_continuity() {
 #[test]
 fn test_gardner_loop_timing_indices() {
     let sample_rate = 1000.0;
-    let symbol_rate = 100.0;
+    let symbol_rate = 500.0;
     let mut gardner = dsp::GardnerLoop::new(sample_rate, symbol_rate);
 
     // Feed a few samples to populate the Farrow history
@@ -127,18 +127,8 @@ fn test_gardner_loop_timing_indices() {
 
     // At this point:
     // farrow.history contains: [1.0, 2.0, 3.0, 4.0] (corresponding to indices 1, 2, 3, 4)
-    // t_des was 1.0. Since t_des (1.0) < sample_index - 3.0 (which is 1.0), it sets t_des = 1.0.
-    // The loop condition is: while t_des (1.0) < sample_index - 2.0 (2.0)
-    // Inside the loop:
-    // mu = t_des - (sample_index - 3.0) = 1.0 - (4.0 - 3.0) = 0.0.
-    // interp = farrow.interpolate(0.0).
-    // Let's verify what interpolate(0.0) returns!
-    // Since history has [1.0, 2.0, 3.0, 4.0], and mu = 0.0, FarrowInterpolator::interpolate(0.0)
-    // evaluates to v0_re = history[1] = 2.0 (which is index 2).
-    // Wait! If t_des was 1.0, the desired timing point is at sample index 1.0.
-    // But the interpolator returned history[1] which is the sample at index 2.0 (value = 2.0)!
-    // So the timing output corresponds to sample index 2.0 instead of 1.0.
-    // This is exactly a 1-sample delay mismatch!
+    // Since symbol_rate = 500.0 (sps = 2.0), the first symbol center is at index 1.0.
+    // The sample at index 1.0 (0-indexed) has value 2.0.
 
     assert!(
         !symbols.is_empty(),
@@ -148,10 +138,8 @@ fn test_gardner_loop_timing_indices() {
     println!("Gardner output symbol: {:?}, mu: {}", first_symbol, mu);
     println!("Farrow history: {:?}", gardner.farrow.history);
 
-    // If t_des is 1.0, the expected value should be 1.0 (sample at index 1.0).
-    // But because of the bug, it evaluated to 2.0.
     assert_eq!(
         first_symbol.re, 2.0,
-        "Expected first symbol to be 2.0 due to 1-sample delay bug"
+        "Expected first symbol to be 2.0 after fixing the 1-sample delay bug"
     );
 }

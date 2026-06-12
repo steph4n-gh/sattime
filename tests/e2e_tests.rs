@@ -100,7 +100,7 @@ fn test_r2_adaptive_ekf_by_default() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     // When implemented, adaptive EKF should be active by default
     assert!(
-        stderr.contains("Adaptive EKF active") || stderr.contains("Ingesting Live VHF"),
+        stderr.contains("Adaptive EKF active"),
         "Adaptive EKF is not active by default"
     );
 }
@@ -180,7 +180,7 @@ fn test_r3_dual_stage_lock_default() {
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Dual-stage lock detector active") || stderr.contains("Ingesting Live VHF")
+        stderr.contains("Dual-stage lock detector active")
     );
 }
 
@@ -260,7 +260,6 @@ fn test_r4_multihypothesis_default() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("Multi-hypothesis tracking active")
-            || stderr.contains("Ingesting Live VHF")
     );
 }
 
@@ -338,7 +337,7 @@ fn test_r5_gardner_default() {
     ]);
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Gardner active") || stderr.contains("Ingesting Live VHF"));
+    assert!(stderr.contains("Gardner active"));
 }
 
 #[test]
@@ -550,7 +549,7 @@ fn test_r2_ekf_extremely_noisy_signal() {
         "0",
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("low SNR stable") || stderr.contains("Ingesting Live VHF"));
+    assert!(stderr.contains("low SNR stable"));
 }
 
 #[test]
@@ -562,7 +561,7 @@ fn test_r2_ekf_bandwidth_clamp_boundaries() {
         "passes/starlink.tle",
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Q bound clamp") || stderr.contains("Ingesting Live VHF"));
+    assert!(stderr.contains("Q bound clamp"));
 }
 
 // --- Feature 3: R3 Dual-Stage Lock Detector ---
@@ -576,7 +575,7 @@ fn test_r3_all_quadrature_power() {
         "passes/starlink.tle",
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("quadrature power near zero") || stderr.contains("Ingesting Live VHF"));
+    assert!(stderr.contains("quadrature power near zero"));
 }
 
 #[test]
@@ -588,7 +587,7 @@ fn test_r3_brief_signal_fade() {
         "passes/starlink.tle",
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("fade ride-through") || stderr.contains("Ingesting Live VHF"));
+    assert!(stderr.contains("fade ride-through"));
 }
 
 #[test]
@@ -642,7 +641,7 @@ fn test_r4_clock_steering_suspension() {
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("NTP clock steering suspended") || stderr.contains("Ingesting Live VHF")
+        stderr.contains("NTP clock steering suspended")
     );
 }
 
@@ -655,7 +654,7 @@ fn test_r4_clock_steering_resume() {
         "passes/starlink.tle",
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("NTP clock steering resumed") || stderr.contains("Ingesting Live VHF"));
+    assert!(stderr.contains("NTP clock steering resumed"));
 }
 
 #[test]
@@ -667,7 +666,7 @@ fn test_r4_bank_crossover() {
         "passes/starlink.tle",
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("smooth handover") || stderr.contains("Ingesting Live VHF"));
+    assert!(stderr.contains("smooth handover"));
 }
 
 #[test]
@@ -691,7 +690,7 @@ fn test_r4_ekf_prediction_accuracy() {
         "passes/starlink.tle",
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("prediction RMSE") || stderr.contains("Ingesting Live VHF"));
+    assert!(stderr.contains("prediction RMSE"));
 }
 
 // --- Feature 5: R5 Gardner Symbol Timing Recovery ---
@@ -733,7 +732,7 @@ fn test_r5_timing_error_zero() {
         "passes/starlink.tle",
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Gardner TED zero error") || stderr.contains("Ingesting Live VHF"));
+    assert!(stderr.contains("Gardner TED zero error"));
 }
 
 #[test]
@@ -745,7 +744,7 @@ fn test_r5_timing_error_sign() {
         "passes/starlink.tle",
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Gardner TED sign check") || stderr.contains("Ingesting Live VHF"));
+    assert!(stderr.contains("Gardner TED sign check"));
 }
 
 #[test]
@@ -758,7 +757,7 @@ fn test_r5_gardner_under_heavy_fade() {
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Gardner loop stable under fade") || stderr.contains("Ingesting Live VHF")
+        stderr.contains("Gardner loop stable under fade")
     );
 }
 
@@ -777,7 +776,6 @@ fn test_t3_adaptive_ekf_dual_lock_coupling() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("adaptive process noise transitions")
-            || stderr.contains("Ingesting Live VHF")
     );
 }
 
@@ -791,7 +789,7 @@ fn test_t3_multi_hypothesis_steering_fade() {
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("steering suspended during fade") || stderr.contains("Ingesting Live VHF")
+        stderr.contains("steering suspended during fade")
     );
 }
 
@@ -804,7 +802,7 @@ fn test_t3_gardner_ekf_cooperation() {
         "passes/starlink.tle",
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Gardner EKF cooperation") || stderr.contains("Ingesting Live VHF"));
+    assert!(stderr.contains("Gardner EKF cooperation"));
 }
 
 #[test]
@@ -816,7 +814,7 @@ fn test_t3_nonblocking_threading_cpu_overhead() {
         "passes/starlink.tle",
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("CPU overhead under limit") || stderr.contains("Ingesting Live VHF"));
+    assert!(stderr.contains("CPU overhead under limit"));
 }
 
 #[test]
@@ -853,7 +851,7 @@ fn test_t4_bpsk_fading_pass() {
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("converges with RMSE < 150 Hz") || stderr.contains("Ingesting Live VHF")
+        stderr.contains("converges with RMSE < 150 Hz")
     );
 }
 
@@ -868,7 +866,6 @@ fn test_t4_starlink_high_doppler_spurs() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("tracks the true signal instead of the spur")
-            || stderr.contains("Ingesting Live VHF")
     );
 }
 
@@ -881,7 +878,7 @@ fn test_t4_low_snr_qpsk_symbol_lock() {
         "passes/starlink.tle",
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("constellation clustering") || stderr.contains("Ingesting Live VHF"));
+    assert!(stderr.contains("constellation clustering"));
 }
 
 #[test]
@@ -911,5 +908,5 @@ fn test_t4_daemon_long_term_stability() {
         "passes/starlink.tle",
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("zero memory leaks") || stderr.contains("Ingesting Live VHF"));
+    assert!(stderr.contains("zero memory leaks"));
 }

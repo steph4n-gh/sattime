@@ -1,13 +1,8 @@
-use crate::daemon::*;
 use crate::ekf::*;
-use crate::orbit::*;
-use crate::tui::*;
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use chrono::{DateTime, Utc};
 use num_complex::Complex;
 use rustfft::FftPlanner;
-use sgp4::Elements;
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Modulation {
     #[default]
@@ -85,7 +80,7 @@ impl GardnerLoop {
         Self {
             farrow: FarrowInterpolator::new(),
             sample_index: 0.0,
-            t_des: 2.0,
+            t_des: 1.0,
             step,
             sps,
             kp: 0.01,
@@ -101,7 +96,7 @@ impl GardnerLoop {
     pub fn reset(&mut self) {
         self.farrow.reset();
         self.sample_index = 0.0;
-        self.t_des = 2.0;
+        self.t_des = 1.0;
         self.integrator = 0.0;
         self.is_on_time = true;
         self.on_time_prev = Complex::new(0.0, 0.0);
@@ -118,12 +113,12 @@ impl GardnerLoop {
             return;
         }
 
-        if self.t_des < self.sample_index - 2.0 {
-            self.t_des = self.sample_index - 2.0;
+        if self.t_des < self.sample_index - 3.0 {
+            self.t_des = self.sample_index - 3.0;
         }
 
-        while self.t_des < self.sample_index - 1.0 {
-            let mu = self.t_des - (self.sample_index - 2.0);
+        while self.t_des < self.sample_index - 2.0 {
+            let mu = self.t_des - (self.sample_index - 3.0);
             if !(0.0..1.0).contains(&mu) {
                 break;
             }
@@ -191,6 +186,7 @@ pub fn design_lowpass_filter(cutoff_hz: f64, sample_rate_hz: f64, num_taps: usiz
 #[derive(Clone)]
 pub struct FirDecimator {
     pub taps: Vec<f32>,
+    pub taps_simd: Vec<f32>,
     pub decimation_factor: usize,
     pub history: Vec<Complex<f32>>,
     pub pending_offset: usize,
@@ -199,8 +195,14 @@ pub struct FirDecimator {
 impl FirDecimator {
     pub fn new(taps: Vec<f32>, decimation_factor: usize) -> Self {
         let hist_len = taps.len().saturating_sub(1);
+        let mut taps_simd = Vec::with_capacity(taps.len() * 2);
+        for &t in &taps {
+            taps_simd.push(t);
+            taps_simd.push(t);
+        }
         Self {
             taps,
+            taps_simd,
             decimation_factor,
             history: vec![Complex::new(0.0, 0.0); hist_len],
             pending_offset: 0,
@@ -212,6 +214,121 @@ impl FirDecimator {
             *s = Complex::new(0.0, 0.0);
         }
         self.pending_offset = 0;
+    }
+
+    #[inline(always)]
+    pub fn compute(&self, window: &[Complex<f32>]) -> Complex<f32> {
+        let num_taps = self.taps.len();
+        assert!(window.len() >= num_taps);
+
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            return unsafe { self.compute_x86_64(window) };
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return unsafe { self.compute_aarch64(window) };
+        }
+
+        self.compute_scalar(window)
+    }
+
+    #[inline(always)]
+    pub fn compute_scalar(&self, window: &[Complex<f32>]) -> Complex<f32> {
+        let num_taps = self.taps.len();
+        assert!(window.len() >= num_taps);
+        let mut re = 0.0;
+        let mut im = 0.0;
+        let window_ptr = window.as_ptr() as *const f32;
+        let taps_ptr = self.taps_simd.as_ptr();
+        let len = self.taps_simd.len();
+        
+        let mut i = 0;
+        while i < len {
+            unsafe {
+                re += *window_ptr.add(i) * *taps_ptr.add(i);
+                im += *window_ptr.add(i + 1) * *taps_ptr.add(i + 1);
+            }
+            i += 2;
+        }
+        Complex::new(re, im)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn compute_x86_64(&self, window: &[Complex<f32>]) -> Complex<f32> {
+        let num_taps = self.taps.len();
+        assert!(window.len() >= num_taps);
+        use std::arch::x86_64::*;
+        let window_ptr = window.as_ptr() as *const f32;
+        let taps_ptr = self.taps_simd.as_ptr();
+        let len = self.taps_simd.len();
+        
+        let mut sum = unsafe { _mm256_setzero_ps() };
+        let mut i = 0;
+        while i + 8 <= len {
+            unsafe {
+                let w = _mm256_loadu_ps(window_ptr.add(i));
+                let t = _mm256_loadu_ps(taps_ptr.add(i));
+                sum = _mm256_fmadd_ps(w, t, sum);
+            }
+            i += 8;
+        }
+        
+        let mut sum_arr = [0.0; 8];
+        unsafe { _mm256_storeu_ps(sum_arr.as_mut_ptr(), sum) };
+        
+        let mut re = sum_arr[0] + sum_arr[2] + sum_arr[4] + sum_arr[6];
+        let mut im = sum_arr[1] + sum_arr[3] + sum_arr[5] + sum_arr[7];
+        
+        while i < len {
+            unsafe {
+                re += *window_ptr.add(i) * *taps_ptr.add(i);
+                im += *window_ptr.add(i + 1) * *taps_ptr.add(i + 1);
+            }
+            i += 2;
+        }
+        
+        Complex::new(re, im)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    unsafe fn compute_aarch64(&self, window: &[Complex<f32>]) -> Complex<f32> {
+        let num_taps = self.taps.len();
+        assert!(window.len() >= num_taps);
+        use std::arch::aarch64::*;
+        let window_ptr = window.as_ptr() as *const f32;
+        let taps_ptr = self.taps_simd.as_ptr();
+        let len = self.taps_simd.len();
+        
+        let mut sum = vdupq_n_f32(0.0);
+        let mut i = 0;
+        while i + 4 <= len {
+            unsafe {
+                let w = vld1q_f32(window_ptr.add(i));
+                let t = vld1q_f32(taps_ptr.add(i));
+                sum = vfmaq_f32(sum, w, t);
+            }
+            i += 4;
+        }
+        
+        let mut sum_arr = [0.0; 4];
+        unsafe { vst1q_f32(sum_arr.as_mut_ptr(), sum) };
+        
+        let mut re = sum_arr[0] + sum_arr[2];
+        let mut im = sum_arr[1] + sum_arr[3];
+        
+        while i < len {
+            unsafe {
+                re += *window_ptr.add(i) * *taps_ptr.add(i);
+                im += *window_ptr.add(i + 1) * *taps_ptr.add(i + 1);
+            }
+            i += 2;
+        }
+        
+        Complex::new(re, im)
     }
 
     pub fn process(&mut self, input: &[Complex<f32>], output: &mut Vec<Complex<f32>>) {
@@ -245,15 +362,11 @@ impl FirDecimator {
             idx += self.decimation_factor;
         }
 
-        // Main Phase: contiguous slice processing (no branches, auto-vectorizable)
+        // Main Phase: contiguous slice processing (using SIMD)
         while idx + num_taps <= total_len {
-            let mut sum = Complex::new(0.0f32, 0.0f32);
             let input_offset = idx - hist_len;
             let input_slice = &input[input_offset..input_offset + num_taps];
-            for n in 0..num_taps {
-                sum += input_slice[n] * self.taps[n];
-            }
-            output.push(sum);
+            output.push(self.compute(input_slice));
             idx += self.decimation_factor;
         }
 
@@ -267,6 +380,165 @@ impl FirDecimator {
             self.history.copy_within(input.len().., 0);
             self.history[shift..].copy_from_slice(input);
         }
+    }
+}
+
+fn complex_cholesky_6x6(a: &[[Complex<f32>; 6]; 6]) -> Option<[[Complex<f32>; 6]; 6]> {
+    let mut l = [[Complex::new(0.0, 0.0); 6]; 6];
+    for i in 0..6 {
+        for j in 0..=i {
+            let mut sum = a[i][j];
+            for k in 0..j {
+                sum -= l[i][k] * l[j][k].conj();
+            }
+            if i == j {
+                if sum.re <= 0.0 {
+                    return None;
+                }
+                l[i][j] = Complex::new(sum.re.sqrt(), 0.0);
+            } else {
+                l[i][j] = sum / l[j][j].re;
+            }
+        }
+    }
+    Some(l)
+}
+
+fn complex_cholesky_solve_6(a: &[[Complex<f32>; 6]; 6], b: &[Complex<f32>; 6]) -> Option<[Complex<f32>; 6]> {
+    let l = complex_cholesky_6x6(a)?;
+    // Forward substitution L * y = b
+    let mut y = [Complex::new(0.0, 0.0); 6];
+    for i in 0..6 {
+        let mut sum = b[i];
+        for k in 0..i {
+            sum -= l[i][k] * y[k];
+        }
+        y[i] = sum / l[i][i].re;
+    }
+    // Backward substitution L^H * x = y
+    let mut x = [Complex::new(0.0, 0.0); 6];
+    for i in (0..6).rev() {
+        let mut sum = y[i];
+        for k in i+1..6 {
+            sum -= l[k][i].conj() * x[k];
+        }
+        x[i] = sum / l[i][i].re;
+    }
+    Some(x)
+}
+
+/// Extensive Cancellation Algorithm (ECA) filter
+/// Uses exact Orthogonal Subspace Projection on blocks of samples to obliterate 
+/// the direct path and stationary clutter down to the noise floor.
+#[derive(Clone, Debug)]
+pub struct EcaCanceler {
+    history: [Complex<f32>; 6],
+}
+
+impl EcaCanceler {
+    pub fn new() -> Self {
+        Self {
+            history: [Complex::new(0.0, 0.0); 6],
+        }
+    }
+
+    pub fn process_block(
+        &mut self,
+        input: &[Complex<f32>],
+        output: &mut [Complex<f32>],
+    ) {
+        let n = input.len();
+        if n == 0 { return; }
+        
+        let taps = 6;
+        let mut r = [[Complex::new(0.0, 0.0); 6]; 6];
+        let mut p = [Complex::new(0.0, 0.0); 6];
+
+        // Construct extended signal x_ext = [history, input]
+        let mut x_ext = vec![Complex::new(0.0, 0.0); n + 6];
+        x_ext[0..6].copy_from_slice(&self.history);
+        x_ext[6..n+6].copy_from_slice(input);
+
+        // 1. Compute r[0][d] for d in 0..5 using O(N) operations
+        for d in 0..taps {
+            let mut sum = Complex::new(0.0, 0.0);
+            for i in 0..n {
+                sum += x_ext[5 + i].conj() * x_ext[5 + i - d];
+            }
+            r[0][d] = sum;
+        }
+
+        // 2. Compute the rest of the upper triangle of r using O(1) sliding window updates
+        for d in 0..taps {
+            for j in 1..(taps - d) {
+                let term_in = x_ext[5 - j].conj() * x_ext[5 - j - d];
+                let term_out = x_ext[5 - j + n].conj() * x_ext[5 - j + n - d];
+                r[j][j + d] = r[j - 1][j - 1 + d] + term_in - term_out;
+            }
+        }
+
+        // 3. Fill in the lower triangle of r using Hermitian symmetry
+        for j in 0..taps {
+            for k in 0..j {
+                r[j][k] = r[k][j].conj();
+            }
+        }
+
+        // 4. Compute p[j] for j in 0..5 using O(N) operations
+        for j in 0..taps {
+            let mut sum = Complex::new(0.0, 0.0);
+            for i in 0..n {
+                sum += x_ext[5 + i - j].conj() * input[i];
+            }
+            p[j] = sum;
+        }
+
+        // Diagonal regularization (Ridge / Tikhonov)
+        let tau = 1e-3 * n as f32; 
+        for j in 0..taps {
+            r[j][j] += Complex::new(tau, 0.0);
+        }
+
+        let weights = match complex_cholesky_solve_6(&r, &p) {
+            Some(w) => w,
+            None => [Complex::new(0.0, 0.0); 6],
+        };
+
+        // 5. Generate outputs
+        for i in 0..n {
+            let mut y_clutter = Complex::new(0.0, 0.0);
+            for k in 0..taps {
+                y_clutter += x_ext[5 + i - k] * weights[k];
+            }
+            output[i] = input[i] - y_clutter;
+        }
+
+        // Update history
+        for i in 0..6 {
+            self.history[i] = if n > 5 - i {
+                input[n - 1 - (5 - i)]
+            } else {
+                self.history[self.history.len() - (5 - i) + n]
+            };
+        }
+    }
+}
+
+static ADIC_WEIGHTS: std::sync::OnceLock<[f64; 32]> = std::sync::OnceLock::new();
+
+#[inline(always)]
+fn get_adic_weight(v_2: u32) -> f64 {
+    let weights = ADIC_WEIGHTS.get_or_init(|| {
+        let mut arr = [0.0f64; 32];
+        for i in 0..32 {
+            arr[i] = 2.0_f64.powf(1.5 * i as f64);
+        }
+        arr
+    });
+    if (v_2 as usize) < weights.len() {
+        weights[v_2 as usize]
+    } else {
+        2.0_f64.powf(1.5 * v_2 as f64)
     }
 }
 
@@ -333,11 +605,11 @@ impl EnvelopeWaveletSpurCanceller {
         let threshold_wavelet = 3.0 * median;
         let threshold_vladimirov = 10.0 * median;
 
-        // Precompute weights w_d and their prefix sums P_k
+        // Precompute weights w_d and their prefix sums P_k using cached 2-adic weights
         let mut w = vec![0.0f64; n];
         for d in 1..n {
             let v_2 = d.trailing_zeros();
-            w[d] = 2.0_f64.powf(1.5 * v_2 as f64);
+            w[d] = get_adic_weight(v_2);
         }
         let mut p = vec![0.0f64; n];
         for k in 1..n {
@@ -362,7 +634,7 @@ impl EnvelopeWaveletSpurCanceller {
             w_complex[d] = Complex::new(w[d], 0.0);
             w_complex[2 * n - d] = Complex::new(w[d], 0.0);
         }
-        let w_n = 2.0_f64.powf(1.5 * n.trailing_zeros() as f64);
+        let w_n = get_adic_weight(n.trailing_zeros());
         w_complex[n] = Complex::new(w_n, 0.0);
 
         // Perform forward FFTs using rustfft
@@ -674,6 +946,8 @@ pub struct DemodChannel {
     pub normalized_iq: Vec<Complex<f32>>,
     pub last_processed_len: usize,
     pub sample_count: usize,
+    pub eca_enabled: bool,
+    pub eca_canceler: EcaCanceler,
 }
 
 impl DemodChannel {
@@ -690,6 +964,7 @@ impl DemodChannel {
         fade_timeout: f64,
         taps: Vec<f32>,
         decimate_factor: usize,
+        eca_enabled: bool,
     ) -> Self {
         let decimated_rate = pipeline_sample_rate / decimate_factor as f64;
         let mut pll_tracker = CarrierPllEkf::new(decimated_rate, modulation);
@@ -776,6 +1051,8 @@ impl DemodChannel {
             normalized_iq: Vec::new(),
             last_processed_len: 0,
             sample_count: 0,
+            eca_enabled,
+            eca_canceler: EcaCanceler::new(),
         }
     }
 
@@ -796,6 +1073,7 @@ impl DemodChannel {
             5.0,
             taps,
             decimate_factor,
+            false,
         );
         ch.nominal_freq = nominal_freq;
         ch.sample_rate = sample_rate;
@@ -876,19 +1154,23 @@ impl DemodChannel {
         self.mixed_samples
             .resize(raw_iq.len(), Complex::new(0.0, 0.0));
 
-        // a. Resize and copy raw_iq into self.normalized_iq.
+        // a. Resize self.normalized_iq.
         self.normalized_iq.resize(raw_iq.len(), Complex::new(0.0, 0.0));
-        self.normalized_iq.copy_from_slice(raw_iq);
 
-        // b. Perform Subspace Projection for LO Leakage Cancellation by subtracting the block mean.
-        let n = self.normalized_iq.len() as f64;
-        let mut sum = Complex::<f64>::new(0.0, 0.0);
-        for &s in &self.normalized_iq {
-            sum += Complex::new(s.re as f64, s.im as f64);
-        }
-        let mean = Complex::new((sum.re / n) as f32, (sum.im / n) as f32);
-        for s in &mut self.normalized_iq {
-            *s -= mean;
+        // b. Perform Subspace Projection / ECA for LO Leakage and Clutter Cancellation.
+        if self.eca_enabled {
+            self.eca_canceler.process_block(raw_iq, &mut self.normalized_iq);
+        } else {
+            self.normalized_iq.copy_from_slice(raw_iq);
+            let n = self.normalized_iq.len() as f64;
+            let mut sum = Complex::<f64>::new(0.0, 0.0);
+            for &s in &self.normalized_iq {
+                sum += Complex::new(s.re as f64, s.im as f64);
+            }
+            let mean = Complex::new((sum.re / n) as f32, (sum.im / n) as f32);
+            for s in &mut self.normalized_iq {
+                *s -= mean;
+            }
         }
 
         // c. Invoke self.ddc.process.

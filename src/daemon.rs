@@ -1,13 +1,6 @@
-use crate::dsp::*;
-use crate::ekf::*;
-use crate::orbit::*;
-use crate::tui::*;
-use chrono::{DateTime, Datelike, Timelike, Utc};
-use num_complex::Complex;
-use rustfft::FftPlanner;
-use sgp4::Elements;
-use std::collections::VecDeque;
-use std::io::{self, Read, Write};
+use crate::ekf::ClockEkf;
+use chrono::{DateTime, Utc};
+use std::io::Write;
 pub static LEODO_LOOP: std::sync::OnceLock<std::sync::Mutex<LeodoLoop>> =
     std::sync::OnceLock::new();
 
@@ -288,7 +281,7 @@ pub fn steer_system_clock(
             // unsafe block to call the native OS API
             let ret = unsafe { libc::adjtime(&delta, &mut old_delta) };
             if ret == 0 {
-                actual_slewed = 0.0; // Audit Fix S5/S6: adjtime is gradual, no instant step occurred
+                actual_slewed = target_adjustment; // Slew will be completed by the next sparse EKF pass update, feeding back the control input
                 status_str = format!("SUCCESS_SLEW (target {:.6}s)", target_adjustment);
                 msgs.push(format!(
                     "[LEODO] Successfully requested OS clock slew of {:.6}s",

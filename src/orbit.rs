@@ -1,14 +1,7 @@
 use crate::daemon::*;
-use crate::dsp::*;
-use crate::ekf::*;
 use crate::orbit_solver;
-use crate::tui::*;
 use chrono::{DateTime, Datelike, Timelike, Utc};
-use num_complex::Complex;
-use rustfft::FftPlanner;
-use sgp4::Elements;
-use std::collections::VecDeque;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 pub static GEOLOCATION_RESULT: std::sync::OnceLock<std::sync::Mutex<GeolocationResult>> =
     std::sync::OnceLock::new();
 
@@ -1440,14 +1433,18 @@ pub fn find_pca_time(
     constants: &sgp4::Constants,
     elements: &sgp4::Elements,
     pos_obs: [f64; 3],
+    around_time: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
     let mut min_range = f64::MAX;
     let mut best_mins = 0.0;
 
-    // 1. Grid search in minutes from -180.0 to +180.0
-    let steps = 360;
+    let epoch_dt = elements.datetime.and_utc();
+    let target_mins = (around_time - epoch_dt).num_milliseconds() as f64 / 60000.0;
+
+    // 1. Grid search in minutes from target_mins - 50.0 to target_mins + 50.0
+    let steps = 100;
     for step in 0..=steps {
-        let mins = -180.0 + (step as f64);
+        let mins = target_mins - 50.0 + (step as f64);
         if let Ok(prediction) = constants.propagate(sgp4::MinutesSinceEpoch(mins)) {
             let pos_teme = [
                 prediction.position[0] * 1000.0,
@@ -1513,7 +1510,7 @@ pub fn fit_satellite(
     measured_pca_time: DateTime<Utc>,
 ) -> Option<(f64, f64, f64)> {
     // 1. Find predicted PCA time for this satellite
-    let predicted_pca_time = find_pca_time(constants, elements, pos_obs)?;
+    let predicted_pca_time = find_pca_time(constants, elements, pos_obs, measured_pca_time)?;
 
     // 2. Estimate initial delta_t (difference between local capture PCA and orbital predicted PCA)
     let est_delta_t = (measured_pca_time - predicted_pca_time).num_milliseconds() as f64 / 1000.0;
@@ -1658,11 +1655,67 @@ pub fn fit_satellite(
         }
     }
 
+    // Microsecond-level refinement (10 microsecond steps over a +/- 1 ms window)
+    let mut micro_min_rmse = refined_min_rmse;
+    let mut micro_best_delta_t = refined_best_delta_t;
+    let mut micro_best_freq_offset = refined_best_freq_offset;
+
     if refined_min_rmse < f64::MAX {
+        let micro_steps = 200;
+        let start_t = refined_best_delta_t - 0.001;
+        for step in 0..=micro_steps {
+            let delta_t = start_t + (step as f64) * 0.00001;
+            let mut y = Vec::with_capacity(data.len());
+
+            for (idx, &(dt, freq_meas)) in data.iter().enumerate() {
+                if let Some((pos_teme, vel_teme)) = precomputed_states[idx] {
+                    let pos_teme_true = [
+                        pos_teme[0] - delta_t * vel_teme[0],
+                        pos_teme[1] - delta_t * vel_teme[1],
+                        pos_teme[2] - delta_t * vel_teme[2],
+                    ];
+                    let dt_true = dt - chrono::Duration::microseconds((delta_t * 1e6) as i64);
+                    let jd = datetime_to_jd(dt_true);
+                    let (pos_sat, vel_sat) = teme_to_ecef(jd, pos_teme_true, vel_teme);
+
+                    let rx = pos_sat[0] - pos_obs[0];
+                    let ry = pos_sat[1] - pos_obs[1];
+                    let rz = pos_sat[2] - pos_obs[2];
+                    let range = (rx * rx + ry * ry + rz * rz).sqrt();
+                    let range_rate = (rx * vel_sat[0] + ry * vel_sat[1] + rz * vel_sat[2]) / range;
+                    let doppler_term = 1.0 - range_rate / 299792458.0;
+
+                    y.push(freq_meas - center_freq * doppler_term);
+                }
+            }
+
+            if y.len() > data.len() / 2 {
+                let sum: f64 = y.iter().sum();
+                let count = y.len() as f64;
+                let df0 = sum / count;
+                let sq_sum: f64 = y
+                    .iter()
+                    .map(|&val| {
+                        let diff = val - df0;
+                        diff * diff
+                    })
+                    .sum();
+                let rmse = (sq_sum / count).sqrt();
+
+                if rmse < micro_min_rmse {
+                    micro_min_rmse = rmse;
+                    micro_best_delta_t = delta_t;
+                    micro_best_freq_offset = df0;
+                }
+            }
+        }
+    }
+
+    if micro_min_rmse < f64::MAX {
         Some((
-            refined_best_delta_t,
-            refined_best_freq_offset,
-            refined_min_rmse,
+            micro_best_delta_t,
+            micro_best_freq_offset,
+            micro_min_rmse,
         ))
     } else {
         None
@@ -1678,6 +1731,9 @@ pub fn save_pass_data(
     use std::fs::File;
     use std::io::Write;
 
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut file = File::create(path)?;
     writeln!(file, "# satellite_name: {}", sat_name)?;
     writeln!(file, "# center_frequency: {}", center_freq)?;

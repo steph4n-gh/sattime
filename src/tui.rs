@@ -1,5 +1,5 @@
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, KeyCode},
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -17,17 +17,11 @@ use ratatui::{
 };
 
 use crate::daemon::*;
-use crate::dsp::*;
-use crate::ekf::*;
 use crate::orbit::*;
 use crate::{Args, get_process_rss_mb};
-use chrono::{DateTime, Datelike, Timelike, Utc};
 use crossbeam_channel::Receiver;
-use num_complex::Complex;
-use rustfft::FftPlanner;
-use sgp4::Elements;
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
 const CHANNEL_COLORS: [Color; 8] = [
     Color::Yellow,

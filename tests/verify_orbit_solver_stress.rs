@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 
 pub mod orbit {
     use super::*;
@@ -282,20 +282,18 @@ fn test_stress_measurement_noise() {
         let guess_i = sim.truth_i + 2.0_f64.to_radians();
 
         let solved_res = orbit_solver::fit_orbit_doppler(&passes, sim.rec_ecef, guess_a, guess_i);
-        match solved_res {
-            Ok(solved) => {
+        if noise <= 10.0 {
+            let solved = solved_res.expect("Solver should converge for low noise");
+            let err_a = (solved.a - sim.truth_a).abs();
+            let err_i = (solved.i - sim.truth_i).abs().to_degrees();
+            assert!(err_a < 1000.0, "a error too large for noise={}: {}", noise, err_a);
+            assert!(err_i < 0.05, "i error too large for noise={}: {}", noise, err_i);
+        } else {
+            // For higher noise levels (100, 1000 Hz), if it succeeds, error must be finite, or it returns Err.
+            if let Ok(solved) = solved_res {
                 let err_a = (solved.a - sim.truth_a).abs();
                 let err_i = (solved.i - sim.truth_i).abs().to_degrees();
-                println!(
-                    "NOISE LEVEL [{:.1} Hz] -> Solved err_a={:.1}m, err_i={:.4} deg",
-                    noise, err_a, err_i
-                );
-            }
-            Err(e) => {
-                println!(
-                    "NOISE LEVEL [{:.1} Hz] -> Solver failed to converge: {}",
-                    noise, e
-                );
+                assert!(err_a.is_finite() && err_i.is_finite());
             }
         }
     }
@@ -318,17 +316,18 @@ fn test_stress_receiver_position_offset() {
         let guess_i = sim.truth_i + 2.0_f64.to_radians();
 
         let solved_res = orbit_solver::fit_orbit_doppler(&passes, shifted_ecef, guess_a, guess_i);
-        match solved_res {
-            Ok(solved) => {
+        if offset <= 100.0 {
+            let solved = solved_res.expect("Solver should converge for low receiver shift");
+            let err_a = (solved.a - sim.truth_a).abs();
+            let err_i = (solved.i - sim.truth_i).abs().to_degrees();
+            assert!(err_a < 1000.0, "a error too large for offset={}: {}", offset, err_a);
+            assert!(err_i < 0.05, "i error too large for offset={}: {}", offset, err_i);
+        } else {
+            // For larger offsets, if it succeeds, error must be finite, or it returns Err.
+            if let Ok(solved) = solved_res {
                 let err_a = (solved.a - sim.truth_a).abs();
                 let err_i = (solved.i - sim.truth_i).abs().to_degrees();
-                println!(
-                    "RECEIVER SHIFT [{:.1}m] -> Solved err_a={:.1}m, err_i={:.4} deg",
-                    offset, err_a, err_i
-                );
-            }
-            Err(e) => {
-                println!("RECEIVER SHIFT [{:.1}m] -> Solver failed: {}", offset, e);
+                assert!(err_a.is_finite() && err_i.is_finite());
             }
         }
     }
@@ -341,11 +340,11 @@ fn test_stress_extreme_inputs() {
 
     // Test extreme semi-major axis (e.g. extremely small or near earth radius)
     let solved_small = orbit_solver::fit_orbit_doppler(&passes, sim.rec_ecef, 1000.0, sim.truth_i);
-    println!("EXTREME SMALL GUESS (a=1000.0) -> {:?}", solved_small);
+    assert!(solved_small.is_err(), "Expected error for extremely small semi-major axis guess");
 
     // Test extreme large guess
     let solved_large = orbit_solver::fit_orbit_doppler(&passes, sim.rec_ecef, 1e12, sim.truth_i);
-    println!("EXTREME LARGE GUESS (a=1e12) -> {:?}", solved_large);
+    assert!(solved_large.is_err(), "Expected error for extremely large semi-major axis guess");
 
     // Test invalid/empty passes
     let empty_passes: Vec<orbit_solver::RawPass> = vec![];

@@ -9,27 +9,14 @@ use crate::dsp::*;
 use crate::ekf::*;
 use crate::orbit::*;
 use crate::tui::*;
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use num_complex::Complex;
 use rustfft::FftPlanner;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, KeyCode},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
-    symbols,
-    text::Span,
-    widgets::{Axis, Block, Borders, Cell, Chart, Dataset, Paragraph, Row, Sparkline, Table},
-};
+use crossterm::event::{self, KeyCode};
 
 use serde::{Deserialize, Serialize};
 
@@ -184,6 +171,14 @@ pub struct Args {
     /// Disable dynamic background spur cancellation (notching) (on by default)
     #[arg(long = "no-notch-spurs")]
     no_notch_spurs: bool,
+
+    /// Disable Extensive Cancellation Algorithm (ECA) clutter filter on channels (on by default)
+    #[arg(long = "no-eca")]
+    no_eca: bool,
+
+    /// Legacy flag to enable ECA (now enabled by default)
+    #[arg(long = "eca", hide = true)]
+    eca: bool,
 
     /// Disable real-time visual Terminal UI (TUI) dashboard (on by default)
     #[arg(long = "no-tui")]
@@ -602,7 +597,13 @@ fn main() {
     unsafe {
         std::env::set_var("SOAPY_SDR_LOG_LEVEL", "WARNING");
     }
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // Automatically session-timestamp the default "passes" directory to give a fresh slate on every run
+    if args.output_dir == "passes" {
+        let session_timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+        args.output_dir = format!("passes/session_{}", session_timestamp);
+    }
 
     if let Ok(mut loop_lock) = get_leodo_loop().lock() {
         loop_lock.shm_unit = args.leodo_shm;
@@ -883,7 +884,7 @@ fn main() {
 
         // Find PCA time
         let pca_time =
-            find_pca_time(&constants, elements, pos_obs).expect("Failed to find PCA time");
+            find_pca_time(&constants, elements, pos_obs, elements.datetime.and_utc()).expect("Failed to find PCA time");
 
         // Sim parameters: 90.0 seconds centered at PCA
         let duration_secs = 90.0;
@@ -1655,7 +1656,7 @@ fn main() {
     let mut start_system_time = if args.sim_start_time && !satellites.is_empty() {
         let (_sat_name, elements) = &satellites[0];
         if let Ok(constants) = sgp4::Constants::from_elements(elements) {
-            if let Some(pca_time) = find_pca_time(&constants, elements, pos_obs) {
+            if let Some(pca_time) = find_pca_time(&constants, elements, pos_obs, elements.datetime.and_utc()) {
                 let base_time = pca_time - chrono::Duration::microseconds((45.0 * 1e6) as i64);
                 base_time + chrono::Duration::microseconds((args.sim_offset * 1e6) as i64)
             } else {
@@ -1670,7 +1671,7 @@ fn main() {
     let mut _active_pca_time = if !satellites.is_empty() {
         let (_sat_name, elements) = &satellites[0];
         if let Ok(constants) = sgp4::Constants::from_elements(elements) {
-            find_pca_time(&constants, elements, pos_obs)
+            find_pca_time(&constants, elements, pos_obs, start_system_time)
         } else {
             None
         }
@@ -1687,7 +1688,7 @@ fn main() {
 
     // Design filter and decimator (127 taps for stopband attenuation)
     let taps = design_lowpass_filter(0.4 * pipeline_sample_rate, args.sample_rate, 127);
-    let mut decimator = FirDecimator::new(taps.clone(), decimate);
+    let mut _decimator = FirDecimator::new(taps.clone(), decimate);
     let mut raw_decimator = FirDecimator::new(taps.clone(), decimate);
     let mut decimated_samples = Vec::new();
     let mut pll_tracker = CarrierPllEkf::new(pipeline_sample_rate, args.modulation);
@@ -1714,10 +1715,11 @@ fn main() {
             args.fade_timeout,
             taps.clone(),
             decimate,
+            !args.no_eca,
         ));
     }
 
-    let mut single_spur_dwell_steps = 0;
+    let mut _single_spur_dwell_steps = 0;
     let mut single_ekf_timed_out = false;
 
     let mut tracking_bank = if !args.no_multihypothesis {
@@ -1807,7 +1809,7 @@ fn main() {
 
     let mut visible_expected_frequencies = Vec::new();
     let mut next_pass_info = String::from("Next rise: Calculating...");
-    let mut active_min_snr = args.min_snr;
+    let active_min_snr = args.min_snr;
     let mut snr_db = 0.0f32;
     if !satellites.is_empty() {
         let jd = datetime_to_jd(start_system_time);
@@ -2038,7 +2040,7 @@ fn main() {
                         if !satellites.is_empty() {
                             let (_sat_name, elements) = &satellites[0];
                             if let Ok(constants) = sgp4::Constants::from_elements(elements) {
-                                _active_pca_time = find_pca_time(&constants, elements, pos_obs);
+                                _active_pca_time = find_pca_time(&constants, elements, pos_obs, chrono::Utc::now());
                             } else {
                                 _active_pca_time = None;
                             }
@@ -2077,7 +2079,7 @@ fn main() {
 
                 // 2. Clear decimator history to prevent transient pollution
                 let taps = design_lowpass_filter(0.4 * pipeline_sample_rate, args.sample_rate, 31);
-                decimator = FirDecimator::new(taps, decimate);
+                _decimator = FirDecimator::new(taps, decimate);
 
                 // 3. Reset PLL tracker lock state
                 pll_tracker.is_locked = false;
@@ -2365,7 +2367,7 @@ fn main() {
 
         if !channels.is_empty() {
             pll_tracker = channels[0].pll_tracker.clone();
-            decimator = channels[0].decimator.clone();
+            _decimator = channels[0].decimator.clone();
             tracking_bank = channels[0].tracking_bank.clone();
         }
 
@@ -2841,7 +2843,7 @@ fn main() {
                                                     sgp4::Constants::from_elements(elements)
                                                 {
                                                     _active_pca_time = find_pca_time(
-                                                        &constants, elements, pos_obs,
+                                                        &constants, elements, pos_obs, chrono::Utc::now(),
                                                     );
                                                 } else {
                                                     _active_pca_time = None;
@@ -2871,7 +2873,7 @@ fn main() {
                                 consecutive_unlock = 0;
                                 daemon_state = DaemonState::Searching;
                                 pll_tracker.is_locked = false;
-                                single_spur_dwell_steps = 0;
+                                _single_spur_dwell_steps = 0;
                                 if let Some(ref mut bank) = tracking_bank {
                                     for t in &mut bank.trackers {
                                         t.is_locked = false;
@@ -3862,7 +3864,7 @@ mod tests {
         if has_satellites && !visible_expected_frequencies.is_empty() {
             // nothing
         } else {
-            unlocked_frames_during_pass = 0;
+
             fallback_to_unguided = false;
         }
         assert!(!fallback_to_unguided);

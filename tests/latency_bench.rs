@@ -129,7 +129,7 @@ fn test_latency_measurements() {
             // Let's measure if it blocks
             let send_start = Instant::now();
             let res = tx_clone.send_timeout(samples, Duration::from_millis(1));
-            let send_elapsed = send_start.elapsed();
+            let _send_elapsed = send_start.elapsed();
 
             if res.is_err() {
                 drop_count += 1;

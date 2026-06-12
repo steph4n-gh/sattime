@@ -36,9 +36,9 @@ But what if you are offline? What if you are in a remote field, at sea, or want 
 
 To correct our drifting local clock, we need a reliable reference clock to compare it against. Fortunately, there is a constellation of clocks flying overhead right now. 
 
-Low Earth Orbit (LEO) satellites, such as those in weather satellite networks or communication constellations, orbit the Earth at altitudes between one hundred and one thousand miles. Because these satellites need to coordinate their operations, they carry highly precise clocks on board, which are regularly synchronized with ground-based atomic clocks.
+Low Earth Orbit (LEO) satellites, such as those in weather satellite networks or communication constellations, orbit the Earth at altitudes between one hundred and one thousand miles. These satellites continuously broadcast radio signals on known frequencies as part of their normal operations — telemetry, beacons, or communication links.
 
-We can think of these LEO satellites as a "space watch". As a satellite passes overhead, it broadcasts a radio signal containing its orbital parameters (where it is in space) and the exact time it sent the signal. By listening to this space watch, our local receiver can compare its own clock against the satellite's atomic clock.
+Critically, `sattime` does not decode any data from these satellites, nor does it rely on any onboard clock. Instead, it exploits a fundamental physical phenomenon: the **Doppler effect**. As a satellite moves toward or away from you at high speed, the frequency of its radio signal shifts in a predictable way determined entirely by geometry and orbital mechanics. By measuring this frequency shift over time, we can extract precise timing and position information — without any cooperation from the satellite itself.
 
 Using LEO satellites has a huge advantage over traditional GPS satellites. GPS satellites orbit much higher, around twelve thousand miles up, which means their signals are incredibly weak by the time they reach Earth. They require a clear line of sight to the sky. LEO satellites are much closer, so their signals are much stronger and can often be received with simple, home-made antennas.
 
@@ -56,15 +56,15 @@ The exact same thing happens with radio waves! A satellite is like a cosmic trai
 
 ### Reverse-GPS and Clock Steering
 
-By measuring the exact shape of this Doppler curve, we can perform a fascinating trick called Reverse-GPS. 
+By measuring the shape of this Doppler curve, we can perform a fascinating trick called Reverse-GPS. 
 
-In normal GPS navigation, your phone listens to four or more satellites at the same time to calculate your position. With Reverse-GPS, we only need to listen to a single satellite during its pass. 
+In normal GPS navigation, your phone listens to four or more satellites at the same time to calculate your position. With Reverse-GPS using Doppler, we can extract timing from a single satellite pass. For geolocation, we need multiple passes from different satellites to triangulate position.
 
-Because we know the satellite's exact path in space from its orbital data, the shape of the Doppler curve tells us exactly how close the satellite came to our antenna and at what moment. If the frequency changes very rapidly from high to low, the satellite passed directly overhead. If the frequency changes slowly, the satellite passed far to the side. 
+Because we know the satellite's predicted path in space from its orbital data (TLEs), the shape of the Doppler curve tells us how close the satellite came to our antenna and approximately when. If the frequency changes very rapidly from high to low, the satellite passed directly overhead. If the frequency changes slowly, the satellite passed far to the side. 
 
 By analyzing this curve, we can solve two mysteries at once:
-1. **Where we are**: We can pinpoint our own latitude and longitude on Earth.
-2. **What time it is**: We can calculate the exact error of our local computer clock and "steer" it back to matching the satellite's atomic time. We adjust our clock phase and speed to align the local clock with the satellite's atomic time.
+1. **Where we are**: We can estimate our own latitude and longitude on Earth (to within a few kilometers outdoors, or tens of kilometers indoors due to multipath).
+2. **What time it is**: We can calculate the error of our local computer clock and "steer" it to align with UTC, using the geometry of the satellite's orbit as the timing reference.
 
 ---
 
@@ -118,7 +118,7 @@ Normally, the receiver scans the radio dial to find the whistle's pitch. But onc
 2. The **frequency** of the wave (how high or low the pitch of the whistle is).
 3. The **chirp rate** (how fast the pitch is sliding down as the satellite rushes overhead).
 
-By predicting the wave's movement sample-by-sample, these robotic ears can block out 99% of the background static. This allows us to track the space whistle even when it is so weak that human ears would hear nothing but hiss. The resulting tracking data is so clean that our orbital math can solve our location and clock offset with **20 times more precision** than before!
+By predicting the wave's movement sample-by-sample, these robotic ears can suppress most of the background static. This allows us to track the space whistle even when it is so weak that human ears would hear nothing but hiss. The resulting tracking data is significantly cleaner than raw FFT peak detection, giving the orbital solvers higher-quality Doppler measurements to work with.
 
 ---
 
@@ -159,7 +159,7 @@ Let us explore these four additions through simple, real-world analogies.
 Imagine you are blindfolded and dropped onto a rugged mountain range, and you want to find the highest peak. 
 - **The Old Way (Grid Search)**: You would walk in a rigid grid pattern across the mountains, taking steps exactly every 50 feet. If the peak is small and sits between your grid lines, you will walk right past it and miss it entirely. This is slow, mechanical, and easily misses the target.
 - **The Adelic Langevin Solver**: Instead of walking mindlessly, you use a smart stochastic climber. The climber feels the slope under their feet (the gradient) and walks upward. To avoid getting stuck in a small ditch, the climber occasionally "teleports" randomly to nearby spots. 
-The key aspect of this approach is: these teleports are guided by *p-adic* numbers. Instead of just walking on continuous paths, the climber jumps back and forth across a discrete fractal map. By combining smooth continuous steps (using standard real numbers) with fractal jumps (using discrete $p$-adic primes), the solver can search massive orbital spaces without getting stuck in local traps, finding the satellite's exact orbit with incredible speed and accuracy.
+The key aspect of this approach is: these teleports are guided by *p-adic* numbers. Instead of just walking on continuous paths, the climber jumps back and forth across a discrete fractal map. By combining smooth continuous steps (using standard real numbers) with fractal jumps (using discrete $p$-adic primes), the solver can search massive orbital spaces without getting stuck in local traps, finding the satellite's orbit parameters efficiently even in the presence of many local minima.
 
 ### 2. Sheaf Cohomology & Čech Obstruction: Overlapping Opinions
 Imagine you are in a crowded, echoey room trying to write down what a speaker is saying. You have three listeners in different parts of the room.

@@ -1,4 +1,4 @@
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{TimeZone, Utc};
 use num_complex::Complex;
 
 #[path = "../src/dsp.rs"]
@@ -165,10 +165,10 @@ fn test_solve_linear_system_nan_propagation() {
 
 #[test]
 fn test_fit_orbit_doppler_nan_inputs() {
-    let (passes, rec_ecef, _, _, _, _) = create_mock_passes();
+    let (passes, _rec_ecef, _, _, _, _) = create_mock_passes();
     let bad_ecef = [f64::NAN, 0.0, 0.0];
     let res = orbit_solver::fit_orbit_doppler(&passes, bad_ecef, 7000e3, 0.5);
-    assert!(res.is_err() || res.is_ok());
+    assert!(res.is_err(), "Expected solver to fail with NaN inputs");
 }
 
 // --- Sheaf Cohomology & Tracker Consensus Discrepancy Gaps ---
