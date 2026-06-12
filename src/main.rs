@@ -878,7 +878,7 @@ fn main() {
 
         // Find PCA time
         let pca_time =
-            find_pca_time(&constants, elements, pos_obs).expect("Failed to find PCA time");
+            find_pca_time(&constants, elements, pos_obs, elements.datetime.and_utc()).expect("Failed to find PCA time");
 
         // Sim parameters: 90.0 seconds centered at PCA
         let duration_secs = 90.0;
@@ -1650,7 +1650,7 @@ fn main() {
     let mut start_system_time = if args.sim_start_time && !satellites.is_empty() {
         let (_sat_name, elements) = &satellites[0];
         if let Ok(constants) = sgp4::Constants::from_elements(elements) {
-            if let Some(pca_time) = find_pca_time(&constants, elements, pos_obs) {
+            if let Some(pca_time) = find_pca_time(&constants, elements, pos_obs, elements.datetime.and_utc()) {
                 let base_time = pca_time - chrono::Duration::microseconds((45.0 * 1e6) as i64);
                 base_time + chrono::Duration::microseconds((args.sim_offset * 1e6) as i64)
             } else {
@@ -1665,7 +1665,7 @@ fn main() {
     let mut _active_pca_time = if !satellites.is_empty() {
         let (_sat_name, elements) = &satellites[0];
         if let Ok(constants) = sgp4::Constants::from_elements(elements) {
-            find_pca_time(&constants, elements, pos_obs)
+            find_pca_time(&constants, elements, pos_obs, start_system_time)
         } else {
             None
         }
@@ -2034,7 +2034,7 @@ fn main() {
                         if !satellites.is_empty() {
                             let (_sat_name, elements) = &satellites[0];
                             if let Ok(constants) = sgp4::Constants::from_elements(elements) {
-                                _active_pca_time = find_pca_time(&constants, elements, pos_obs);
+                                _active_pca_time = find_pca_time(&constants, elements, pos_obs, chrono::Utc::now());
                             } else {
                                 _active_pca_time = None;
                             }
@@ -2837,7 +2837,7 @@ fn main() {
                                                     sgp4::Constants::from_elements(elements)
                                                 {
                                                     _active_pca_time = find_pca_time(
-                                                        &constants, elements, pos_obs,
+                                                        &constants, elements, pos_obs, chrono::Utc::now(),
                                                     );
                                                 } else {
                                                     _active_pca_time = None;

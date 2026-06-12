@@ -1433,14 +1433,18 @@ pub fn find_pca_time(
     constants: &sgp4::Constants,
     elements: &sgp4::Elements,
     pos_obs: [f64; 3],
+    around_time: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
     let mut min_range = f64::MAX;
     let mut best_mins = 0.0;
 
-    // 1. Grid search in minutes from -180.0 to +180.0
+    let epoch_dt = elements.datetime.and_utc();
+    let target_mins = (around_time - epoch_dt).num_milliseconds() as f64 / 60000.0;
+
+    // 1. Grid search in minutes from target_mins - 180.0 to target_mins + 180.0
     let steps = 360;
     for step in 0..=steps {
-        let mins = -180.0 + (step as f64);
+        let mins = target_mins - 180.0 + (step as f64);
         if let Ok(prediction) = constants.propagate(sgp4::MinutesSinceEpoch(mins)) {
             let pos_teme = [
                 prediction.position[0] * 1000.0,
@@ -1506,7 +1510,7 @@ pub fn fit_satellite(
     measured_pca_time: DateTime<Utc>,
 ) -> Option<(f64, f64, f64)> {
     // 1. Find predicted PCA time for this satellite
-    let predicted_pca_time = find_pca_time(constants, elements, pos_obs)?;
+    let predicted_pca_time = find_pca_time(constants, elements, pos_obs, measured_pca_time)?;
 
     // 2. Estimate initial delta_t (difference between local capture PCA and orbital predicted PCA)
     let est_delta_t = (measured_pca_time - predicted_pca_time).num_milliseconds() as f64 / 1000.0;
