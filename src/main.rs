@@ -176,6 +176,10 @@ pub struct Args {
     #[arg(long = "no-eca")]
     no_eca: bool,
 
+    /// Legacy flag to enable ECA (now enabled by default)
+    #[arg(long = "eca", hide = true)]
+    eca: bool,
+
     /// Disable real-time visual Terminal UI (TUI) dashboard (on by default)
     #[arg(long = "no-tui")]
     no_tui: bool,
