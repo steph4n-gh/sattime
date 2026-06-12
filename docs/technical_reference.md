@@ -53,7 +53,7 @@ To reduce CPU load and isolate the VHF Doppler shift band ($\approx \pm 20\text{
     $$\omega_c = 2 \pi f_c$$
   - Sinc Filter Coefficients:
     $$h_{sinc}[n] = \begin{cases} \frac{\omega_c}{\pi} & \text{if } |n - M| < 10^{-9} \\ \frac{\sin(\omega_c (n - M))}{\pi (n - M)} & \text{otherwise} \end{cases}$$
-    where $M = \frac{N-1}{2}$ is the middle index, and $N$ is the number of filter taps ($N = 31$ taps).
+    where $M = \frac{N-1}{2}$ is the middle index, and $N$ is the number of filter taps ($N = 127$ taps).
   - Hamming Window Formulation:
     $$w[n] = 0.54 - 0.46 \cos\left(\frac{2 \pi n}{N - 1}\right), \quad n \in \{0, \dots, N-1\}$$
   - Normalised Taps:
@@ -680,7 +680,7 @@ The input Software Defined Radio (SDR) streams raw complex IQ samples at high ra
 2. **Decimation**:
    The downconverted sequence $y_{mix}[n]$ is decimated by factor $D$ (down to $f_{decimated} = f_s / D$) through a windowed low-pass FIR filter:
    $$y_{dec}[m] = \sum_{k=0}^{N-1} y_{mix}[m \cdot D - k] \cdot \text{taps}[k]$$
-   where $N = 31$ taps and $\text{taps}[k]$ are windowed-sinc coefficients.
+   where $N = 127$ taps and $\text{taps}[k]$ are windowed-sinc coefficients.
    Rayon multi-threading parallelizes this pipeline across active channels:
    $$\mathbf{Channels} \parallel \text{map}(\text{process\_block\_with\_center})$$
 
