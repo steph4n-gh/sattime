@@ -36,7 +36,7 @@ pub mod orbit;
 pub mod tui;
 
 use daemon::{CompletedPassData, ConsensusSteeringEngine};
-use ekf::{ChannelAllocator, DemodChannel, TelemetryUpdate, process_pipeline_parallel};
+use ekf::{ChannelAllocator, DemodChannel, process_pipeline_parallel};
 use orbit::{ECEFCoordinates, GeodeticCoordinates, RealTimeGeoSolver, Velocity};
 
 // Helper function: Convert WGS84 to ECEF

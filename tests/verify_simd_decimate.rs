@@ -26,7 +26,7 @@ fn test_simd_decimate_equivalence() {
     let mut idx = 0;
     let total_len = hist_len + input.len();
     
-    let mut history = vec![Complex::new(0.0, 0.0); hist_len];
+    let history = vec![Complex::new(0.0, 0.0); hist_len];
     let mut output_scalar = Vec::new();
     
     // Boundary phase scalar

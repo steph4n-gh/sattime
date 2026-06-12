@@ -1,13 +1,8 @@
-use crate::daemon::*;
 use crate::ekf::*;
-use crate::orbit::*;
-use crate::tui::*;
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use chrono::{DateTime, Utc};
 use num_complex::Complex;
 use rustfft::FftPlanner;
-use sgp4::Elements;
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Modulation {
     #[default]
@@ -85,7 +80,7 @@ impl GardnerLoop {
         Self {
             farrow: FarrowInterpolator::new(),
             sample_index: 0.0,
-            t_des: 2.0,
+            t_des: 1.0,
             step,
             sps,
             kp: 0.01,
@@ -101,7 +96,7 @@ impl GardnerLoop {
     pub fn reset(&mut self) {
         self.farrow.reset();
         self.sample_index = 0.0;
-        self.t_des = 2.0;
+        self.t_des = 1.0;
         self.integrator = 0.0;
         self.is_on_time = true;
         self.on_time_prev = Complex::new(0.0, 0.0);
@@ -118,12 +113,12 @@ impl GardnerLoop {
             return;
         }
 
-        if self.t_des < self.sample_index - 2.0 {
-            self.t_des = self.sample_index - 2.0;
+        if self.t_des < self.sample_index - 3.0 {
+            self.t_des = self.sample_index - 3.0;
         }
 
-        while self.t_des < self.sample_index - 1.0 {
-            let mu = self.t_des - (self.sample_index - 2.0);
+        while self.t_des < self.sample_index - 2.0 {
+            let mu = self.t_des - (self.sample_index - 3.0);
             if !(0.0..1.0).contains(&mu) {
                 break;
             }
@@ -308,7 +303,7 @@ impl FirDecimator {
         let taps_ptr = self.taps_simd.as_ptr();
         let len = self.taps_simd.len();
         
-        let mut sum = unsafe { vdupq_n_f32(0.0) };
+        let mut sum = vdupq_n_f32(0.0);
         let mut i = 0;
         while i + 4 <= len {
             unsafe {

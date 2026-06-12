@@ -487,7 +487,7 @@ fn test_langevin_extreme_noise() {
         }
     }
     let solved = orbit_solver::fit_orbit_doppler(&noisy_passes, rec_ecef, truth_a, truth_i);
-    assert!(solved.is_ok() || solved.is_err());
+    assert!(solved.is_err(), "Extreme noise should cause fit_orbit_doppler to fail");
 }
 
 #[test]
@@ -508,7 +508,7 @@ fn test_langevin_flat_jacobian() {
 fn test_langevin_parameter_overflow() {
     let (passes, rec_ecef, _, _, _, _) = create_mock_passes();
     let solved = orbit_solver::fit_orbit_doppler(&passes, rec_ecef, 1e20, 1e20);
-    assert!(solved.is_err() || solved.is_ok());
+    assert!(solved.is_err(), "Overflow parameters should cause fit_orbit_doppler to fail");
 }
 
 #[test]
@@ -604,7 +604,7 @@ fn test_tracker_consensus_floating_point_extreme() {
         spur_dwell_counter: 0,
     };
     let obs = bank.compute_tracker_discrepancy();
-    assert!(obs.is_finite() || obs.is_nan());
+    assert_eq!(obs, 0.0);
 }
 
 #[test]
@@ -642,11 +642,7 @@ fn test_wavelet_zero_spectrum() {
 fn test_wavelet_infinite_spur() {
     let mut magnitudes = vec![f32::INFINITY; 512];
     dsp::EnvelopeWaveletSpurCanceller::notch_spurs_wavelet(&mut magnitudes, 10.0, 0.0);
-    assert!(
-        magnitudes[256].is_infinite()
-            || magnitudes[256].is_nan()
-            || magnitudes[256] < f32::INFINITY
-    );
+    assert!(magnitudes[256].is_infinite(), "Expected magnitude to remain infinite");
 }
 
 #[test]
@@ -667,7 +663,7 @@ fn test_wavelet_nyquist_boundary() {
 fn test_wavelet_rapid_sweep() {
     let mut magnitudes = vec![1.0; 256];
     dsp::EnvelopeWaveletSpurCanceller::notch_spurs_wavelet(&mut magnitudes, 50.0, 100.0);
-    assert!(magnitudes.len() == 256);
+    assert_eq!(magnitudes, vec![1.0; 256]);
 }
 
 #[test]
@@ -682,7 +678,7 @@ fn test_gain_calibration_zero_input_power() {
 fn test_gain_calibration_max_power_clipping() {
     let samples = vec![Complex::new(1e5, 1e5); 10];
     let power = dsp::AbsolutePowerGainController::estimate_absolute_power(&samples, 0.0, 0.0, 0.0);
-    assert!(power > 0.0 || power.is_finite());
+    assert!(power > 100.0 && power.is_finite());
 }
 
 #[test]
@@ -714,7 +710,7 @@ fn test_gain_calibration_snr_floor() {
     let mut vga = 10.0;
     let mut amp = 0.0;
     dsp::AbsolutePowerGainController::update_gain(&samples, &mut lna, &mut vga, &mut amp);
-    assert!(lna >= 10.0 || lna.is_finite());
+    assert_eq!(lna, 18.0);
 }
 
 // ==========================================

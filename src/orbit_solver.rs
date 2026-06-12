@@ -29,12 +29,15 @@ pub struct SolvedOrbit {
     pub i: f64,     // Inclination in radians
     pub raan0: f64, // RAAN at epoch in radians
     pub u0: f64,    // Argument of latitude at epoch in radians
+    #[allow(dead_code)]
     pub epoch: DateTime<Utc>,
     #[allow(dead_code)]
     pub pass_dts: Vec<f64>,
     #[allow(dead_code)]
     pub pass_dfs: Vec<f64>,
+    #[allow(dead_code)]
     pub pass_df1s: Vec<f64>,
+    #[allow(dead_code)]
     pub pass_df2s: Vec<f64>,
 }
 
@@ -322,6 +325,20 @@ pub fn fit_orbit_doppler(
     initial_a: f64,
     initial_i: f64,
 ) -> Result<SolvedOrbit, Box<dyn std::error::Error>> {
+    if rec_ecef.iter().any(|&x| x.is_nan()) || initial_a.is_nan() || initial_i.is_nan() {
+        return Err("Input parameters contain NaN".into());
+    }
+    if initial_a < 6000e3 || initial_a > 50000e3 || initial_i < 0.0 || initial_i > std::f64::consts::PI {
+        return Err("Input parameters are out of realistic physical bounds".into());
+    }
+    for p in raw_passes {
+        for pt in &p.points {
+            if pt.freq.is_nan() {
+                return Err("Observation frequency contains NaN".into());
+            }
+        }
+    }
+
     let raw_passes_filtered: Vec<RawPass> = raw_passes
         .iter()
         .filter(|p| !p.points.is_empty())
@@ -1022,6 +1039,9 @@ pub fn fit_orbit_doppler(
     }
 
     params = best_params;
+    if best_rss > 1e11 {
+        return Err(format!("Solver failed to converge to a valid orbit (residual RSS too large: {:.2e})", best_rss).into());
+    }
     let mut pass_dts = Vec::new();
     let mut pass_dfs = Vec::new();
     let mut pass_df1s = Vec::new();
@@ -1031,6 +1051,12 @@ pub fn fit_orbit_doppler(
         pass_dfs.push(params[4 + 4 * j + 1]);
         pass_df1s.push(params[4 + 4 * j + 2]);
         pass_df2s.push(params[4 + 4 * j + 3]);
+    }
+
+    for &df in &pass_dfs {
+        if df.abs() > 500e3 {
+            return Err("Estimated frequency offset exceeds realistic physical limits".into());
+        }
     }
 
     Ok(SolvedOrbit {
@@ -1105,6 +1131,7 @@ fn tle_checksum(line: &str) -> u32 {
     sum % 10
 }
 
+#[allow(dead_code)]
 pub fn format_tle_catalog(name: &str, orbit: &SolvedOrbit) -> String {
     let epoch = orbit.epoch;
 

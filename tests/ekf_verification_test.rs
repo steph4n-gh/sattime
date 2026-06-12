@@ -1,6 +1,5 @@
 use num_complex::Complex;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct CalibrationData {
