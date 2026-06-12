@@ -143,8 +143,7 @@ pub fn solve_linear_system(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<
 }
 
 pub fn predict_freq_sample(
-    constants: &sgp4::Constants,
-    elements: &sgp4::Elements,
+    orbit: &OrbitModel,
     pos_obs: [f64; 3],
     center_freq: f64,
     dt: DateTime<Utc>,
@@ -152,23 +151,7 @@ pub fn predict_freq_sample(
     df0: f64,
 ) -> Option<f64> {
     let dt_true = dt - chrono::Duration::microseconds((delta_t * 1e6) as i64);
-    let duration_since_epoch = dt_true.naive_utc().signed_duration_since(elements.datetime);
-    let mins_since_epoch = duration_since_epoch.num_milliseconds() as f64 / 60000.0;
-
-    if let Ok(prediction) = constants.propagate(sgp4::MinutesSinceEpoch(mins_since_epoch)) {
-        let pos_teme = [
-            prediction.position[0] * 1000.0,
-            prediction.position[1] * 1000.0,
-            prediction.position[2] * 1000.0,
-        ];
-        let vel_teme = [
-            prediction.velocity[0] * 1000.0,
-            prediction.velocity[1] * 1000.0,
-            prediction.velocity[2] * 1000.0,
-        ];
-        let jd = datetime_to_jd(dt_true);
-        let (pos_sat, vel_sat) = teme_to_ecef(jd, pos_teme, vel_teme);
-
+    if let Some((pos_sat, vel_sat)) = orbit.propagate_ecef(dt_true) {
         let rx = pos_sat[0] - pos_obs[0];
         let ry = pos_sat[1] - pos_obs[1];
         let rz = pos_sat[2] - pos_obs[2];
@@ -185,8 +168,7 @@ pub fn predict_freq_sample(
 pub struct PassDataRef<'a> {
     #[allow(dead_code)]
     pub name: &'a String,
-    pub elements: &'a sgp4::Elements,
-    pub constants: &'a sgp4::Constants,
+    pub orbit: &'a OrbitModel,
     pub data: &'a Vec<(DateTime<Utc>, f64)>,
     pub center_freq: f64,
 }
@@ -255,8 +237,7 @@ pub fn run_fast_gn_fit(
                 None => pass.data[pass.data.len() / 2].0,
             };
             if let Some((dt_opt, df0_opt, _)) = fit_satellite(
-                pass.constants,
-                pass.elements,
+                pass.orbit,
                 pass.data,
                 current_x_obs,
                 pass.center_freq,
@@ -288,8 +269,7 @@ pub fn run_fast_gn_fit(
 
             for &(dt, freq_meas) in pass.data {
                 if let Some(f_pred) = predict_freq_sample(
-                    pass.constants,
-                    pass.elements,
+                    pass.orbit,
                     current_x_obs,
                     pass.center_freq,
                     dt,
@@ -306,8 +286,7 @@ pub fn run_fast_gn_fit(
                     let pos_lat_plus = wgs84_to_ecef(lat + h_lat, lon, ground_alt);
                     let pos_lat_minus = wgs84_to_ecef(lat - h_lat, lon, ground_alt);
                     let f_lat_plus = predict_freq_sample(
-                        pass.constants,
-                        pass.elements,
+                        pass.orbit,
                         pos_lat_plus,
                         pass.center_freq,
                         dt,
@@ -316,8 +295,7 @@ pub fn run_fast_gn_fit(
                     )
                     .unwrap_or(f_pred);
                     let f_lat_minus = predict_freq_sample(
-                        pass.constants,
-                        pass.elements,
+                        pass.orbit,
                         pos_lat_minus,
                         pass.center_freq,
                         dt,
@@ -332,8 +310,7 @@ pub fn run_fast_gn_fit(
                     let pos_lon_plus = wgs84_to_ecef(lat, lon + h_lon, ground_alt);
                     let pos_lon_minus = wgs84_to_ecef(lat, lon - h_lon, ground_alt);
                     let f_lon_plus = predict_freq_sample(
-                        pass.constants,
-                        pass.elements,
+                        pass.orbit,
                         pos_lon_plus,
                         pass.center_freq,
                         dt,
@@ -342,8 +319,7 @@ pub fn run_fast_gn_fit(
                     )
                     .unwrap_or(f_pred);
                     let f_lon_minus = predict_freq_sample(
-                        pass.constants,
-                        pass.elements,
+                        pass.orbit,
                         pos_lon_minus,
                         pass.center_freq,
                         dt,
@@ -533,12 +509,12 @@ pub fn run_location_solver(
     use std::io::BufRead;
 
     tracing::debug!("\n=== Starting Passive 3D Ground Geolocation Solver ===");
-    tracing::debug!("Loading satellite elements from TLE file: {}", tle_path);
+    tracing::debug!("Loading satellite elements from: {}", tle_path);
 
-    let satellites = match parse_tle_file(tle_path) {
-        Ok(s) => s,
+    let satellites = match load_orbits(tle_path) {
+        Ok(sats) => sats,
         Err(e) => {
-            eprintln!("Error parsing TLE file: {}", e);
+            eprintln!("Error parsing ephemeris file (tried both SP3 and TLE): {}", e);
             return;
         }
     };
@@ -700,8 +676,7 @@ pub fn run_location_solver(
         pub sat_name: String,
         pub center_freq: f64,
         pub data: Vec<(DateTime<Utc>, f64)>,
-        pub elements: sgp4::Elements,
-        pub constants: sgp4::Constants,
+        pub orbit: OrbitModel,
     }
 
     let mut passes = Vec::new();
@@ -723,8 +698,7 @@ pub fn run_location_solver(
         #[derive(Clone)]
         pub struct BlindCandidate {
             pub name: String,
-            pub elements: sgp4::Elements,
-            pub constants: sgp4::Constants,
+            pub orbit: OrbitModel,
             pub pos_sat: [f64; 3],
             pub d_min: f64,
         }
@@ -735,50 +709,37 @@ pub fn run_location_solver(
             let pass = &raw_passes[j];
             let mut candidates = Vec::new();
 
-            for (name, elements) in &satellites {
-                if let Ok(constants) = sgp4::Constants::from_elements(elements) {
-                    let epoch_dt = elements.datetime.and_utc();
-                    let mins = (pass.pca_time - epoch_dt).num_milliseconds() as f64 / 60000.0;
-                    if let Ok(prediction) = constants.propagate(sgp4::MinutesSinceEpoch(mins)) {
-                        let pos_teme = [
-                            prediction.position[0] * 1000.0,
-                            prediction.position[1] * 1000.0,
-                            prediction.position[2] * 1000.0,
-                        ];
-                        let jd = datetime_to_jd(pass.pca_time);
-                        let (pos_sat, _) = teme_to_ecef(jd, pos_teme, [0.0, 0.0, 0.0]);
+            for (name, orbit) in &satellites {
+                if let Some((pos_sat, _)) = orbit.propagate_ecef(pass.pca_time) {
+                    // Distance to reference coordinate
+                    let dx = pos_sat[0] - pos_ref[0];
+                    let dy = pos_sat[1] - pos_ref[1];
+                    let dz = pos_sat[2] - pos_ref[2];
+                    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
 
-                        // Distance to reference coordinate
-                        let dx = pos_sat[0] - pos_ref[0];
-                        let dy = pos_sat[1] - pos_ref[1];
-                        let dz = pos_sat[2] - pos_ref[2];
-                        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+                    if name == "STARLINK-1063"
+                        || name == "STARLINK-1265"
+                        || name == "STARLINK-1477"
+                        || name == "STARLINK-1008"
+                    {
+                        tracing::debug!(
+                            "    [DEBUG] Satellite {} | dist to ref: {:.1} km | pass.d_min: {:.1} km | diff: {:.1} km",
+                            name,
+                            dist / 1000.0,
+                            pass.d_min / 1000.0,
+                            (dist - pass.d_min).abs() / 1000.0
+                        );
+                    }
 
-                        if name == "STARLINK-1063"
-                            || name == "STARLINK-1265"
-                            || name == "STARLINK-1477"
-                            || name == "STARLINK-1008"
-                        {
-                            tracing::debug!(
-                                "    [DEBUG] Satellite {} | dist to ref: {:.1} km | pass.d_min: {:.1} km | diff: {:.1} km",
-                                name,
-                                dist / 1000.0,
-                                pass.d_min / 1000.0,
-                                (dist - pass.d_min).abs() / 1000.0
-                            );
-                        }
-
-                        // Filter: must be within 4000 km of our region to be a candidate,
-                        // AND the distance must match the estimated Doppler slant range within a 1200 km regional margin
-                        if dist < 4000000.0 && (dist - pass.d_min).abs() < 1200000.0 {
-                            candidates.push(BlindCandidate {
-                                name: name.clone(),
-                                elements: elements.clone(),
-                                constants,
-                                pos_sat,
-                                d_min: pass.d_min,
-                            });
-                        }
+                    // Filter: must be within 4000 km of our region to be a candidate,
+                    // AND the distance must match the estimated Doppler slant range within a 1200 km regional margin
+                    if dist < 4000000.0 && (dist - pass.d_min).abs() < 1200000.0 {
+                        candidates.push(BlindCandidate {
+                            name: name.clone(),
+                            orbit: orbit.clone(),
+                            pos_sat,
+                            d_min: pass.d_min,
+                        });
                     }
                 }
             }
@@ -836,22 +797,19 @@ pub fn run_location_solver(
                     let test_passes = vec![
                         PassDataRef {
                             name: &c0.name,
-                            elements: &c0.elements,
-                            constants: &c0.constants,
+                            orbit: &c0.orbit,
                             data: &raw_passes[0].data,
                             center_freq: raw_passes[0].center_freq,
                         },
                         PassDataRef {
                             name: &c1.name,
-                            elements: &c1.elements,
-                            constants: &c1.constants,
+                            orbit: &c1.orbit,
                             data: &raw_passes[1].data,
                             center_freq: raw_passes[1].center_freq,
                         },
                         PassDataRef {
                             name: &c2.name,
-                            elements: &c2.elements,
-                            constants: &c2.constants,
+                            orbit: &c2.orbit,
                             data: &raw_passes[2].data,
                             center_freq: raw_passes[2].center_freq,
                         },
@@ -900,24 +858,21 @@ pub fn run_location_solver(
                 sat_name: c0.name,
                 center_freq: raw_passes[0].center_freq,
                 data: raw_passes[0].data.clone(),
-                elements: c0.elements,
-                constants: c0.constants,
+                orbit: c0.orbit.clone(),
             });
             passes.push(PassData {
                 filename: raw_passes[1].filename.clone(),
                 sat_name: c1.name,
                 center_freq: raw_passes[1].center_freq,
                 data: raw_passes[1].data.clone(),
-                elements: c1.elements,
-                constants: c1.constants,
+                orbit: c1.orbit.clone(),
             });
             passes.push(PassData {
                 filename: raw_passes[2].filename.clone(),
                 sat_name: c2.name,
                 center_freq: raw_passes[2].center_freq,
                 data: raw_passes[2].data.clone(),
-                elements: c2.elements,
-                constants: c2.constants,
+                orbit: c2.orbit.clone(),
             });
         } else {
             tracing::warn!(
@@ -928,8 +883,8 @@ pub fn run_location_solver(
     } else {
         // Standard mode: resolve satellites from CSV headers
         for raw in raw_passes {
-            let found_tle = satellites.iter().find(|(name, _)| name == &raw.sat_name);
-            let (name, elements) = match found_tle {
+            let found_orb = satellites.iter().find(|(name, _)| name == &raw.sat_name);
+            let (name, orbit) = match found_orb {
                 Some(t) => t,
                 None => {
                     let match_sub = satellites.iter().find(|(name, _)| {
@@ -939,7 +894,7 @@ pub fn run_location_solver(
                         Some(t) => t,
                         None => {
                             tracing::warn!(
-                                "Warning: Satellite '{}' from file {:?} not found in TLE database. Skipping.",
+                                "Warning: Satellite '{}' from file {:?} not found in database. Skipping.",
                                 raw.sat_name,
                                 raw.filename
                             );
@@ -949,25 +904,12 @@ pub fn run_location_solver(
                 }
             };
 
-            let constants = match sgp4::Constants::from_elements(elements) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(
-                        "Warning: Failed to initialize SGP4 constants for '{}': {:?}",
-                        name,
-                        e
-                    );
-                    continue;
-                }
-            };
-
             passes.push(PassData {
                 filename: raw.filename,
                 sat_name: name.clone(),
                 center_freq: raw.center_freq,
                 data: raw.data,
-                elements: elements.clone(),
-                constants,
+                orbit: orbit.clone(),
             });
         }
     }
@@ -986,8 +928,7 @@ pub fn run_location_solver(
         .iter()
         .map(|p| PassDataRef {
             name: &p.sat_name,
-            elements: &p.elements,
-            constants: &p.constants,
+            orbit: &p.orbit,
             data: &p.data,
             center_freq: p.center_freq,
         })
@@ -1430,112 +1371,63 @@ pub fn estimate_measured_pca_time(data: &[(DateTime<Utc>, f64)]) -> Option<DateT
 }
 
 pub fn find_pca_time(
-    constants: &sgp4::Constants,
-    elements: &sgp4::Elements,
+    orbit: &OrbitModel,
     pos_obs: [f64; 3],
     around_time: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
     let mut min_range = f64::MAX;
-    let mut best_mins = 0.0;
+    let mut best_secs = 0.0;
 
-    let epoch_dt = elements.datetime.and_utc();
-    let target_mins = (around_time - epoch_dt).num_milliseconds() as f64 / 60000.0;
-
-    // 1. Grid search in minutes from target_mins - 50.0 to target_mins + 50.0
+    // 1. Grid search in minutes from -50.0 to +50.0 relative to around_time
     let steps = 100;
     for step in 0..=steps {
-        let mins = target_mins - 50.0 + (step as f64);
-        if let Ok(prediction) = constants.propagate(sgp4::MinutesSinceEpoch(mins)) {
-            let pos_teme = [
-                prediction.position[0] * 1000.0,
-                prediction.position[1] * 1000.0,
-                prediction.position[2] * 1000.0,
-            ];
-            let epoch_dt = elements.datetime.and_utc();
-            let dt = epoch_dt + chrono::Duration::microseconds((mins * 60.0 * 1e6) as i64);
-            let jd = datetime_to_jd(dt);
-
-            let (pos_ecef, _) = teme_to_ecef(jd, pos_teme, [0.0, 0.0, 0.0]);
-
-            let rx = pos_ecef[0] - pos_obs[0];
-            let ry = pos_ecef[1] - pos_obs[1];
-            let rz = pos_ecef[2] - pos_obs[2];
+        let mins = -50.0 + (step as f64);
+        let dt = around_time + chrono::Duration::microseconds((mins * 60.0 * 1e6) as i64);
+        if let Some((pos_sat, _)) = orbit.propagate_ecef(dt) {
+            let rx = pos_sat[0] - pos_obs[0];
+            let ry = pos_sat[1] - pos_obs[1];
+            let rz = pos_sat[2] - pos_obs[2];
             let range = rx * rx + ry * ry + rz * rz;
             if range < min_range {
                 min_range = range;
-                best_mins = mins;
+                best_secs = mins * 60.0;
             }
         }
     }
 
-    // 2. Refine in seconds from best_mins - 1 to best_mins + 1
-    let mut best_secs = best_mins * 60.0;
+    // 2. Refine in seconds from best_secs - 60 to best_secs + 60
     min_range = f64::MAX;
+    let mut refined_secs = best_secs;
     for s in -60..=60 {
-        let secs = best_mins * 60.0 + (s as f64);
-        let mins = secs / 60.0;
-        if let Ok(prediction) = constants.propagate(sgp4::MinutesSinceEpoch(mins)) {
-            let pos_teme = [
-                prediction.position[0] * 1000.0,
-                prediction.position[1] * 1000.0,
-                prediction.position[2] * 1000.0,
-            ];
-            let epoch_dt = elements.datetime.and_utc();
-            let dt = epoch_dt + chrono::Duration::microseconds((mins * 60.0 * 1e6) as i64);
-            let jd = datetime_to_jd(dt);
-
-            let (pos_ecef, _) = teme_to_ecef(jd, pos_teme, [0.0, 0.0, 0.0]);
-
-            let rx = pos_ecef[0] - pos_obs[0];
-            let ry = pos_ecef[1] - pos_obs[1];
-            let rz = pos_ecef[2] - pos_obs[2];
+        let secs = best_secs + (s as f64);
+        let dt = around_time + chrono::Duration::microseconds((secs * 1e6) as i64);
+        if let Some((pos_sat, _)) = orbit.propagate_ecef(dt) {
+            let rx = pos_sat[0] - pos_obs[0];
+            let ry = pos_sat[1] - pos_obs[1];
+            let rz = pos_sat[2] - pos_obs[2];
             let range = rx * rx + ry * ry + rz * rz;
             if range < min_range {
                 min_range = range;
-                best_secs = secs;
+                refined_secs = secs;
             }
         }
     }
 
-    let epoch_dt = elements.datetime.and_utc();
-    Some(epoch_dt + chrono::Duration::microseconds((best_secs * 1e6) as i64))
+    Some(around_time + chrono::Duration::microseconds((refined_secs * 1e6) as i64))
 }
 
 pub fn fit_satellite(
-    constants: &sgp4::Constants,
-    elements: &sgp4::Elements,
+    orbit: &OrbitModel,
     data: &[(DateTime<Utc>, f64)],
     pos_obs: [f64; 3],
     center_freq: f64,
     measured_pca_time: DateTime<Utc>,
 ) -> Option<(f64, f64, f64)> {
     // 1. Find predicted PCA time for this satellite
-    let predicted_pca_time = find_pca_time(constants, elements, pos_obs, measured_pca_time)?;
+    let predicted_pca_time = find_pca_time(orbit, pos_obs, measured_pca_time)?;
 
     // 2. Estimate initial delta_t (difference between local capture PCA and orbital predicted PCA)
     let est_delta_t = (measured_pca_time - predicted_pca_time).num_milliseconds() as f64 / 1000.0;
-
-    // 3. Precompute satellite TEME states at nominal times (delta_t = 0) to avoid SGP4 propagation in inner search loops
-    let mut precomputed_states = Vec::with_capacity(data.len());
-    for &(dt, _) in data {
-        let duration_since_epoch = dt.naive_utc().signed_duration_since(elements.datetime);
-        let mins_since_epoch = duration_since_epoch.num_milliseconds() as f64 / 60000.0;
-        if let Ok(prediction) = constants.propagate(sgp4::MinutesSinceEpoch(mins_since_epoch)) {
-            let pos_teme = [
-                prediction.position[0] * 1000.0,
-                prediction.position[1] * 1000.0,
-                prediction.position[2] * 1000.0,
-            ];
-            let vel_teme = [
-                prediction.velocity[0] * 1000.0,
-                prediction.velocity[1] * 1000.0,
-                prediction.velocity[2] * 1000.0,
-            ];
-            precomputed_states.push(Some((pos_teme, vel_teme)));
-        } else {
-            precomputed_states.push(None);
-        }
-    }
 
     let mut min_rmse = f64::MAX;
     let mut best_delta_t = 0.0;
@@ -1552,18 +1444,9 @@ pub fn fit_satellite(
             let delta_t = center - 15.0 + (step as f64) * 0.1;
             let mut y = Vec::with_capacity(data.len());
 
-            for (idx, &(dt, freq_meas)) in data.iter().enumerate() {
-                if let Some((pos_teme, vel_teme)) = precomputed_states[idx] {
-                    // Linear translation approximation over the narrow search window
-                    let pos_teme_true = [
-                        pos_teme[0] - delta_t * vel_teme[0],
-                        pos_teme[1] - delta_t * vel_teme[1],
-                        pos_teme[2] - delta_t * vel_teme[2],
-                    ];
-                    let dt_true = dt - chrono::Duration::microseconds((delta_t * 1e6) as i64);
-                    let jd = datetime_to_jd(dt_true);
-                    let (pos_sat, vel_sat) = teme_to_ecef(jd, pos_teme_true, vel_teme);
-
+            for &(dt, freq_meas) in data {
+                let dt_true = dt - chrono::Duration::microseconds((delta_t * 1e6) as i64);
+                if let Some((pos_sat, vel_sat)) = orbit.propagate_ecef(dt_true) {
                     let rx = pos_sat[0] - pos_obs[0];
                     let ry = pos_sat[1] - pos_obs[1];
                     let rz = pos_sat[2] - pos_obs[2];
@@ -1610,18 +1493,9 @@ pub fn fit_satellite(
             let delta_t = start_t + (step as f64) * 0.001;
             let mut y = Vec::with_capacity(data.len());
 
-            for (idx, &(dt, freq_meas)) in data.iter().enumerate() {
-                if let Some((pos_teme, vel_teme)) = precomputed_states[idx] {
-                    // Linear translation approximation over the narrow search window
-                    let pos_teme_true = [
-                        pos_teme[0] - delta_t * vel_teme[0],
-                        pos_teme[1] - delta_t * vel_teme[1],
-                        pos_teme[2] - delta_t * vel_teme[2],
-                    ];
-                    let dt_true = dt - chrono::Duration::microseconds((delta_t * 1e6) as i64);
-                    let jd = datetime_to_jd(dt_true);
-                    let (pos_sat, vel_sat) = teme_to_ecef(jd, pos_teme_true, vel_teme);
-
+            for &(dt, freq_meas) in data {
+                let dt_true = dt - chrono::Duration::microseconds((delta_t * 1e6) as i64);
+                if let Some((pos_sat, vel_sat)) = orbit.propagate_ecef(dt_true) {
                     let rx = pos_sat[0] - pos_obs[0];
                     let ry = pos_sat[1] - pos_obs[1];
                     let rz = pos_sat[2] - pos_obs[2];
@@ -1667,17 +1541,9 @@ pub fn fit_satellite(
             let delta_t = start_t + (step as f64) * 0.00001;
             let mut y = Vec::with_capacity(data.len());
 
-            for (idx, &(dt, freq_meas)) in data.iter().enumerate() {
-                if let Some((pos_teme, vel_teme)) = precomputed_states[idx] {
-                    let pos_teme_true = [
-                        pos_teme[0] - delta_t * vel_teme[0],
-                        pos_teme[1] - delta_t * vel_teme[1],
-                        pos_teme[2] - delta_t * vel_teme[2],
-                    ];
-                    let dt_true = dt - chrono::Duration::microseconds((delta_t * 1e6) as i64);
-                    let jd = datetime_to_jd(dt_true);
-                    let (pos_sat, vel_sat) = teme_to_ecef(jd, pos_teme_true, vel_teme);
-
+            for &(dt, freq_meas) in data {
+                let dt_true = dt - chrono::Duration::microseconds((delta_t * 1e6) as i64);
+                if let Some((pos_sat, vel_sat)) = orbit.propagate_ecef(dt_true) {
                     let rx = pos_sat[0] - pos_obs[0];
                     let ry = pos_sat[1] - pos_obs[1];
                     let rz = pos_sat[2] - pos_obs[2];
@@ -2009,4 +1875,412 @@ fn ecef_to_geodetic(x: f64, y: f64, z: f64) -> GeodeticCoordinates {
         longitude: lon,
         altitude: alt,
     }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Sp3Coordinate {
+    pub time: DateTime<Utc>,
+    pub position: [f64; 3],          // meters
+    pub velocity: Option<[f64; 3]>,   // meters/sec
+    pub clock_offset: f64,           // seconds
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SatelliteOrbit {
+    pub sat_name: String,
+    pub coordinates: Vec<Sp3Coordinate>,
+}
+
+impl SatelliteOrbit {
+    pub fn get_chebyshev_model(&self, dt: DateTime<Utc>) -> Option<ChebyshevOrbit> {
+        let coords = &self.coordinates;
+        if coords.len() < 10 {
+            return None;
+        }
+
+        let t_target = dt;
+        let idx_res = coords.binary_search_by_key(&t_target, |c| c.time);
+        let idx = match idx_res {
+            Ok(i) => i,
+            Err(i) => {
+                if i == 0 {
+                    0
+                } else if i >= coords.len() {
+                    coords.len() - 1
+                } else {
+                    i - 1
+                }
+            }
+        };
+
+        let start_idx = if idx < 4 {
+            0
+        } else if idx + 5 >= coords.len() {
+            coords.len() - 10
+        } else {
+            idx - 4
+        };
+
+        let window = &coords[start_idx..start_idx + 10];
+
+        let t0 = window[0].time.timestamp_nanos_opt()? as f64 * 1e-9;
+        let t9 = window[9].time.timestamp_nanos_opt()? as f64 * 1e-9;
+
+        // Spacing check:
+        let mut uniform = true;
+        let dt_expected = (t9 - t0) / 9.0;
+        for k in 0..9 {
+            let tk = window[k].time.timestamp_nanos_opt()? as f64 * 1e-9;
+            let tk1 = window[k+1].time.timestamp_nanos_opt()? as f64 * 1e-9;
+            if (tk1 - tk - dt_expected).abs() > 1.0 {
+                uniform = false;
+                break;
+            }
+        }
+
+        let mut cx = [0.0; 10];
+        let mut cy = [0.0; 10];
+        let mut cz = [0.0; 10];
+
+        if uniform {
+            static A_INV: std::sync::OnceLock<[[f64; 10]; 10]> = std::sync::OnceLock::new();
+            let a_inv = A_INV.get_or_init(|| {
+                let mut a = [[0.0; 10]; 10];
+                for k in 0..10 {
+                    let tau = -1.0 + 2.0 * k as f64 / 9.0;
+                    let mut t_val = [0.0; 10];
+                    t_val[0] = 1.0;
+                    t_val[1] = tau;
+                    for j in 2..10 {
+                        t_val[j] = 2.0 * tau * t_val[j - 1] - t_val[j - 2];
+                    }
+                    for j in 0..10 {
+                        a[k][j] = t_val[j];
+                    }
+                }
+                invert_matrix_10(&a).expect("Failed to invert Chebyshev matrix")
+            });
+
+            for j in 0..10 {
+                let mut sum_x = 0.0;
+                let mut sum_y = 0.0;
+                let mut sum_z = 0.0;
+                for k in 0..10 {
+                    sum_x += a_inv[j][k] * window[k].position[0];
+                    sum_y += a_inv[j][k] * window[k].position[1];
+                    sum_z += a_inv[j][k] * window[k].position[2];
+                }
+                cx[j] = sum_x;
+                cy[j] = sum_y;
+                cz[j] = sum_z;
+            }
+        } else {
+            let mut a = [[0.0; 10]; 10];
+            for k in 0..10 {
+                let tk = window[k].time.timestamp_nanos_opt()? as f64 * 1e-9;
+                let tau = 2.0 * (tk - t0) / (t9 - t0) - 1.0;
+                let mut t_val = [0.0; 10];
+                t_val[0] = 1.0;
+                t_val[1] = tau;
+                for j in 2..10 {
+                    t_val[j] = 2.0 * tau * t_val[j - 1] - t_val[j - 2];
+                }
+                for j in 0..10 {
+                    a[k][j] = t_val[j];
+                }
+            }
+            if let Some(a_inv) = invert_matrix_10(&a) {
+                for j in 0..10 {
+                    let mut sum_x = 0.0;
+                    let mut sum_y = 0.0;
+                    let mut sum_z = 0.0;
+                    for k in 0..10 {
+                        sum_x += a_inv[j][k] * window[k].position[0];
+                        sum_y += a_inv[j][k] * window[k].position[1];
+                        sum_z += a_inv[j][k] * window[k].position[2];
+                    }
+                    cx[j] = sum_x;
+                    cy[j] = sum_y;
+                    cz[j] = sum_z;
+                }
+            } else {
+                return None;
+            }
+        }
+
+        Some(ChebyshevOrbit { t0, t9, cx, cy, cz })
+    }
+
+    pub fn propagate_ecef(&self, dt: DateTime<Utc>) -> Option<([f64; 3], [f64; 3])> {
+        let model = self.get_chebyshev_model(dt)?;
+        model.evaluate(dt)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ChebyshevOrbit {
+    pub t0: f64,
+    pub t9: f64,
+    pub cx: [f64; 10],
+    pub cy: [f64; 10],
+    pub cz: [f64; 10],
+}
+
+impl ChebyshevOrbit {
+    pub fn evaluate(&self, dt: DateTime<Utc>) -> Option<([f64; 3], [f64; 3])> {
+        let t = dt.timestamp_nanos_opt()? as f64 * 1e-9;
+        let tau = 2.0 * (t - self.t0) / (self.t9 - self.t0) - 1.0;
+        let (x, dx) = evaluate_chebyshev(&self.cx, tau);
+        let (y, dy) = evaluate_chebyshev(&self.cy, tau);
+        let (z, dz) = evaluate_chebyshev(&self.cz, tau);
+
+        let dtau_dt = 2.0 / (self.t9 - self.t0);
+        let vx = dx * dtau_dt;
+        let vy = dy * dtau_dt;
+        let vz = dz * dtau_dt;
+
+        Some(([x, y, z], [vx, vy, vz]))
+    }
+}
+
+fn invert_matrix_10(a: &[[f64; 10]; 10]) -> Option<[[f64; 10]; 10]> {
+    let mut temp = *a;
+    let mut inv = [[0.0; 10]; 10];
+    for i in 0..10 {
+        inv[i][i] = 1.0;
+    }
+
+    for i in 0..10 {
+        let mut max_row = i;
+        let mut max_val = temp[i][i].abs();
+        for r in (i + 1)..10 {
+            if temp[r][i].abs() > max_val {
+                max_val = temp[r][i].abs();
+                max_row = r;
+            }
+        }
+
+        if max_val < 1e-12 {
+            return None;
+        }
+
+        if max_row != i {
+            temp.swap(i, max_row);
+            inv.swap(i, max_row);
+        }
+
+        let pivot = temp[i][i];
+        for c in 0..10 {
+            temp[i][c] /= pivot;
+            inv[i][c] /= pivot;
+        }
+
+        for r in 0..10 {
+            if r != i {
+                let factor = temp[r][i];
+                for c in 0..10 {
+                    temp[r][c] -= factor * temp[i][c];
+                    inv[r][c] -= factor * inv[i][c];
+                }
+            }
+        }
+    }
+
+    Some(inv)
+}
+
+fn evaluate_chebyshev(c: &[f64; 10], tau: f64) -> (f64, f64) {
+    let mut t = [0.0; 10];
+    let mut dt = [0.0; 10];
+
+    t[0] = 1.0;
+    dt[0] = 0.0;
+
+    t[1] = tau;
+    dt[1] = 1.0;
+
+    for j in 2..10 {
+        t[j] = 2.0 * tau * t[j - 1] - t[j - 2];
+        dt[j] = 2.0 * t[j - 1] + 2.0 * tau * dt[j - 1] - dt[j - 2];
+    }
+
+    let mut pos = 0.0;
+    let mut d_tau = 0.0;
+    for j in 0..10 {
+        pos += c[j] * t[j];
+        d_tau += c[j] * dt[j];
+    }
+
+    (pos, d_tau)
+}
+
+#[derive(Clone, Debug)]
+pub enum OrbitModel {
+    Sgp4 {
+        elements: sgp4::Elements,
+        constants: sgp4::Constants,
+    },
+    Sp3 {
+        orbit: SatelliteOrbit,
+    },
+}
+
+impl OrbitModel {
+    pub fn sat_name(&self) -> &str {
+        match self {
+            OrbitModel::Sgp4 { elements, .. } => elements.object_name.as_deref().unwrap_or("UNKNOWN"),
+            OrbitModel::Sp3 { orbit } => &orbit.sat_name,
+        }
+    }
+
+    pub fn epoch(&self) -> DateTime<Utc> {
+        match self {
+            OrbitModel::Sgp4 { elements, .. } => elements.datetime.and_utc(),
+            OrbitModel::Sp3 { orbit } => {
+                if orbit.coordinates.is_empty() {
+                    Utc::now()
+                } else {
+                    orbit.coordinates[0].time
+                }
+            }
+        }
+    }
+
+    pub fn propagate_ecef(&self, dt: DateTime<Utc>) -> Option<([f64; 3], [f64; 3])> {
+        match self {
+            OrbitModel::Sgp4 { elements, constants } => {
+                let duration_since_epoch = dt.naive_utc().signed_duration_since(elements.datetime);
+                let mins_since_epoch = duration_since_epoch.num_milliseconds() as f64 / 60000.0;
+                if let Ok(prediction) = constants.propagate(sgp4::MinutesSinceEpoch(mins_since_epoch)) {
+                    let pos_teme = [
+                        prediction.position[0] * 1000.0,
+                        prediction.position[1] * 1000.0,
+                        prediction.position[2] * 1000.0,
+                    ];
+                    let vel_teme = [
+                        prediction.velocity[0] * 1000.0,
+                        prediction.velocity[1] * 1000.0,
+                        prediction.velocity[2] * 1000.0,
+                    ];
+                    let jd = datetime_to_jd(dt);
+                    Some(teme_to_ecef(jd, pos_teme, vel_teme))
+                } else {
+                    None
+                }
+            }
+            OrbitModel::Sp3 { orbit } => {
+                orbit.propagate_ecef(dt)
+            }
+        }
+    }
+}
+
+pub fn parse_sp3_file(path: &str) -> io::Result<Vec<SatelliteOrbit>> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+    use std::collections::HashMap;
+
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut satellites: HashMap<String, Vec<Sp3Coordinate>> = HashMap::new();
+    let mut current_time: Option<DateTime<Utc>> = None;
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.is_empty() {
+            continue;
+        }
+
+        if parts[0] == "*" {
+            if parts.len() >= 7 {
+                let year: i32 = parts[1].parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let month: u32 = parts[2].parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let day: u32 = parts[3].parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let hour: u32 = parts[4].parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let minute: u32 = parts[5].parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let second_f: f64 = parts[6].parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let second = second_f.trunc() as u32;
+                let nanosecond = (second_f.fract() * 1_000_000_000.0).round() as u32;
+
+                if let Some(naive_dt) = chrono::NaiveDate::from_ymd_opt(year, month, day)
+                    .and_then(|d| d.and_hms_nano_opt(hour, minute, second, nanosecond))
+                {
+                    current_time = Some(DateTime::from_naive_utc_and_offset(naive_dt, Utc));
+                }
+            }
+        } else if parts[0].starts_with('P') {
+            let raw_sat = parts[0];
+            if raw_sat.len() >= 2 {
+                let sat_name = raw_sat[1..].trim().to_string();
+
+                if let Some(time) = current_time {
+                    if parts.len() >= 5 {
+                        let x: f64 = parts[1].parse::<f64>().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))? * 1000.0;
+                        let y: f64 = parts[2].parse::<f64>().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))? * 1000.0;
+                        let z: f64 = parts[3].parse::<f64>().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))? * 1000.0;
+                        let clock_offset_us: f64 = parts[4].parse::<f64>().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        let clock_offset = clock_offset_us * 1e-6;
+
+                        let coord = Sp3Coordinate {
+                            time,
+                            position: [x, y, z],
+                            velocity: None,
+                            clock_offset,
+                        };
+
+                        satellites.entry(sat_name).or_default().push(coord);
+                    }
+                }
+            }
+        } else if parts[0].starts_with('V') {
+            let raw_sat = parts[0];
+            if raw_sat.len() >= 2 {
+                let sat_name = raw_sat[1..].trim().to_string();
+
+                if let Some(coords) = satellites.get_mut(&sat_name) {
+                    if let Some(last_coord) = coords.last_mut() {
+                        if parts.len() >= 4 {
+                            let vx: f64 = parts[1].parse::<f64>().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))? * 0.1;
+                            let vy: f64 = parts[2].parse::<f64>().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))? * 0.1;
+                            let vz: f64 = parts[3].parse::<f64>().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))? * 0.1;
+                            last_coord.velocity = Some([vx, vy, vz]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let result = satellites
+        .into_iter()
+        .map(|(name, mut coords)| {
+            coords.sort_by_key(|c| c.time);
+            SatelliteOrbit { sat_name: name, coordinates: coords }
+        })
+        .collect();
+
+    Ok(result)
+}
+
+pub fn load_orbits(path: &str) -> io::Result<Vec<(String, OrbitModel)>> {
+    let mut satellites = Vec::new();
+    if let Ok(sp3_sats) = parse_sp3_file(path) {
+        if !sp3_sats.is_empty() {
+            for sat in sp3_sats {
+                satellites.push((sat.sat_name.clone(), OrbitModel::Sp3 { orbit: sat }));
+            }
+            return Ok(satellites);
+        }
+    }
+    let tle_sats = parse_tle_file(path)?;
+    for (name, elements) in tle_sats {
+        if let Ok(constants) = sgp4::Constants::from_elements(&elements) {
+            satellites.push((name, OrbitModel::Sgp4 { elements, constants }));
+        }
+    }
+    Ok(satellites)
 }

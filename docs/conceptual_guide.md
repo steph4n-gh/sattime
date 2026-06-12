@@ -210,3 +210,9 @@ If you are lost in a vast forest, you can pinpoint your location if you know you
 - **The Old Way**: You estimate your position by analyzing a single satellite's Doppler shift over its entire pass, which takes several minutes.
 - **Real-Time 3D Geolocation**: When 4 or more satellites are visible, they shine their "coordinate spotlights" on you. Using a Gauss-Newton least-squares solver (a mathematical "warmer-colder" search), the system calculates your latitude, longitude, and altitude at 1 Hz by intersecting the spheres of range measurements. If the geometry is poor (high GDOP), the solver discards the epoch to prevent bad fixes.
 
+### 6. Dual-Frequency Tracking & Ionospheric Delay Cancellation: The Double-Flash Rainbow
+When light passes through a glass prism, it splits into a rainbow because different colors (frequencies) travel at different speeds. The Earth's ionosphere does the same thing to radio waves—it acts as a giant, plasma-filled prism, bending and delaying the satellite's signals.
+- **The Old Way**: A single-frequency receiver has no way of knowing how much the ionosphere has warped the signal. It assumes the signal traveled through a vacuum, which introduces a delay and skews the clock.
+- **The Dual-Frequency Way**: By listening to two different frequencies from the same satellite (like L1 and L2, or dual VHF channels) simultaneously, the receiver can compare them. Since the ionosphere delays one frequency more than the other, we can measure this difference to calculate the exact density of electrons in the air (Total Electron Content, or TEC). We then run the signals through the **Appleton-Hartree formula** (a mathematical 'un-prism') to cancel out the delay completely, leaving us with a perfectly clean, vacuum-speed Doppler signal.
+
+

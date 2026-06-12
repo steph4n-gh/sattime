@@ -433,12 +433,14 @@ fn complex_cholesky_solve_6(a: &[[Complex<f32>; 6]; 6], b: &[Complex<f32>; 6]) -
 #[derive(Clone, Debug)]
 pub struct EcaCanceler {
     history: [Complex<f32>; 6],
+    x_ext: Vec<Complex<f32>>,
 }
 
 impl EcaCanceler {
     pub fn new() -> Self {
         Self {
             history: [Complex::new(0.0, 0.0); 6],
+            x_ext: Vec::new(),
         }
     }
 
@@ -454,16 +456,18 @@ impl EcaCanceler {
         let mut r = [[Complex::new(0.0, 0.0); 6]; 6];
         let mut p = [Complex::new(0.0, 0.0); 6];
 
-        // Construct extended signal x_ext = [history, input]
-        let mut x_ext = vec![Complex::new(0.0, 0.0); n + 6];
-        x_ext[0..6].copy_from_slice(&self.history);
-        x_ext[6..n+6].copy_from_slice(input);
+        // Construct extended signal self.x_ext = [history, input]
+        if self.x_ext.len() != n + 6 {
+            self.x_ext.resize(n + 6, Complex::new(0.0, 0.0));
+        }
+        self.x_ext[0..6].copy_from_slice(&self.history);
+        self.x_ext[6..n+6].copy_from_slice(input);
 
         // 1. Compute r[0][d] for d in 0..5 using O(N) operations
         for d in 0..taps {
             let mut sum = Complex::new(0.0, 0.0);
             for i in 0..n {
-                sum += x_ext[5 + i].conj() * x_ext[5 + i - d];
+                sum += self.x_ext[5 + i].conj() * self.x_ext[5 + i - d];
             }
             r[0][d] = sum;
         }
@@ -471,8 +475,8 @@ impl EcaCanceler {
         // 2. Compute the rest of the upper triangle of r using O(1) sliding window updates
         for d in 0..taps {
             for j in 1..(taps - d) {
-                let term_in = x_ext[5 - j].conj() * x_ext[5 - j - d];
-                let term_out = x_ext[5 - j + n].conj() * x_ext[5 - j + n - d];
+                let term_in = self.x_ext[5 - j].conj() * self.x_ext[5 - j - d];
+                let term_out = self.x_ext[5 - j + n].conj() * self.x_ext[5 - j + n - d];
                 r[j][j + d] = r[j - 1][j - 1 + d] + term_in - term_out;
             }
         }
@@ -488,7 +492,7 @@ impl EcaCanceler {
         for j in 0..taps {
             let mut sum = Complex::new(0.0, 0.0);
             for i in 0..n {
-                sum += x_ext[5 + i - j].conj() * input[i];
+                sum += self.x_ext[5 + i - j].conj() * input[i];
             }
             p[j] = sum;
         }
@@ -508,7 +512,7 @@ impl EcaCanceler {
         for i in 0..n {
             let mut y_clutter = Complex::new(0.0, 0.0);
             for k in 0..taps {
-                y_clutter += x_ext[5 + i - k] * weights[k];
+                y_clutter += self.x_ext[5 + i - k] * weights[k];
             }
             output[i] = input[i] - y_clutter;
         }
@@ -821,9 +825,11 @@ pub enum ChannelCommand {
     Allocate {
         channel_index: usize,
         sat_name: String,
-        elements: sgp4::Elements,
+        orbit: crate::orbit::OrbitModel,
         target_freq: f64,
+        target_freq2: f64,
         initial_freq: f64,
+        frequency2: f64,
     },
     Deallocate {
         channel_index: usize,
@@ -831,6 +837,7 @@ pub enum ChannelCommand {
     UpdateTargetFrequency {
         channel_index: usize,
         target_freq: f64,
+        target_freq2: f64,
     },
 }
 
@@ -898,15 +905,18 @@ pub struct TelemetryUpdate {
 pub struct DemodChannel {
     pub id: usize,
     pub sat_name: String,
-    pub elements: Option<sgp4::Elements>,
-    pub constants: Option<sgp4::Constants>,
+    pub orbit: Option<crate::orbit::OrbitModel>,
     pub status: ChannelStatus,
     pub target_freq: f64,
+    pub target_freq2: f64,
     pub initial_freq: f64,
+    pub frequency2: f64,
 
     // DSP components
     pub ddc: DigitalDownConverter,
+    pub ddc2: DigitalDownConverter,
     pub decimator: FirDecimator,
+    pub decimator2: FirDecimator,
     pub pll_tracker: CarrierPllEkf,
     pub gardner_loop: GardnerLoop,
     pub tracking_bank: Option<EkfTrackingBank>,
@@ -943,11 +953,15 @@ pub struct DemodChannel {
     pub telemetry_sender: Option<crossbeam_channel::Sender<TelemetryUpdate>>,
     pub mixed_samples: Vec<Complex<f32>>,
     pub decimated_samples: Vec<Complex<f32>>,
+    pub mixed_samples2: Vec<Complex<f32>>,
+    pub decimated_samples2: Vec<Complex<f32>>,
     pub normalized_iq: Vec<Complex<f32>>,
     pub last_processed_len: usize,
     pub sample_count: usize,
     pub eca_enabled: bool,
     pub eca_canceler: EcaCanceler,
+    pub is_dual: bool,
+    pub current_tec: f64,
 }
 
 impl DemodChannel {
@@ -1008,14 +1022,17 @@ impl DemodChannel {
         Self {
             id,
             sat_name: String::new(),
-            elements: None,
-            constants: None,
+            orbit: None,
             status: ChannelStatus::Idle,
             target_freq: 0.0,
+            target_freq2: 0.0,
             initial_freq: 0.0,
+            frequency2: 0.0,
 
             ddc: DigitalDownConverter::new(),
-            decimator: FirDecimator::new(taps, decimate_factor),
+            ddc2: DigitalDownConverter::new(),
+            decimator: FirDecimator::new(taps.clone(), decimate_factor),
+            decimator2: FirDecimator::new(taps, decimate_factor),
             pll_tracker,
             gardner_loop: GardnerLoop::new(decimated_rate, sym_rate),
             tracking_bank,
@@ -1048,11 +1065,15 @@ impl DemodChannel {
             telemetry_sender: None,
             mixed_samples: Vec::new(),
             decimated_samples: Vec::new(),
+            mixed_samples2: Vec::new(),
+            decimated_samples2: Vec::new(),
             normalized_iq: Vec::new(),
             last_processed_len: 0,
             sample_count: 0,
             eca_enabled,
             eca_canceler: EcaCanceler::new(),
+            is_dual: false,
+            current_tec: 0.0,
         }
     }
 
@@ -1181,6 +1202,15 @@ impl DemodChannel {
         self.decimator
             .process(&self.mixed_samples, &mut self.decimated_samples);
 
+        if self.is_dual {
+            let freq_to_use2 = self.target_freq2;
+            let f_shift2 = freq_to_use2 - center_freq;
+            self.mixed_samples2.resize(raw_iq.len(), Complex::new(0.0, 0.0));
+            self.ddc2.process(&self.normalized_iq, f_shift2, self.sample_rate, &mut self.mixed_samples2);
+            self.decimated_samples2.clear();
+            self.decimator2.process(&self.mixed_samples2, &mut self.decimated_samples2);
+        }
+
         // Dynamic SNR estimation via M2M4 moments
         let mut m2 = 0.0;
         let mut m4 = 0.0;
@@ -1263,16 +1293,34 @@ impl DemodChannel {
                 }
             }
 
+            if self.is_dual {
+                for s in &mut self.decimated_samples2 {
+                    let norm = s.norm();
+                    if norm > 1e-6 {
+                        *s = *s / norm;
+                    } else {
+                        *s = Complex::new(0.0, 0.0);
+                    }
+                }
+            }
+
             // Execute single or multi-hypothesis tracking updates
             if let Some(ref mut bank) = self.tracking_bank {
                 let mut symbols = Vec::with_capacity(4); // Pre-allocate outside hot loop
-                for &s in &self.decimated_samples {
+                for (s_idx, &s) in self.decimated_samples.iter().enumerate() {
                     for i in 0..3 {
                         let tracker = &mut bank.trackers[i];
                         let g_loop = &mut bank.gardner_loops[i];
 
                         if tracker.is_locked {
-                            if (tracker.ts - decimated_ts).abs() > 1e-9 {
+                            if self.is_dual {
+                                let s2 = self.decimated_samples2[s_idx];
+                                let prev_ts = tracker.ts;
+                                tracker.ts = decimated_ts;
+                                tracker.predict();
+                                tracker.update_dual(s, s2);
+                                tracker.ts = prev_ts;
+                            } else if self.modulation != Modulation::Carrier && (tracker.ts - decimated_ts).abs() > 1e-9 {
                                 let theta = tracker.x[0] / scale;
                                 let cos_theta = (-theta).cos();
                                 let sin_theta = (-theta).sin();
@@ -1367,11 +1415,34 @@ impl DemodChannel {
                     let ch_freq_offset = (active_tracker.x[1] / scale) / (2.0 * std::f64::consts::PI);
                     self.is_locked = true;
                     self.symbol_locked = true;
-                    self.frequency = freq_to_use + ch_freq_offset;
                     self.phase = active_tracker.x[0] / scale;
                     bank.in_fade = false;
                     bank.fade_counter = 0;
                     self.ever_locked = true;
+
+                    if self.is_dual {
+                        let f1 = self.target_freq;
+                        let f2 = self.target_freq2;
+                        let fd1 = ch_freq_offset;
+                        let fd2 = (active_tracker.x[4] / scale) / (2.0 * std::f64::consts::PI);
+                        let f1_abs = f1 + fd1;
+                        let f2_abs = f2 + fd2;
+                        let f_free = AppletonHartreeDispersion::cancel(self.nominal_freq, self.frequency2, f1_abs, f2_abs);
+                        self.frequency = f_free;
+
+                        let theta1 = active_tracker.x[0];
+                        let theta2 = active_tracker.x[3];
+                        if f1 != 0.0 && f2 != 0.0 && (f1 - f2).abs() > 1e-6 {
+                            let f1_sq = f1 * f1;
+                            let f2_sq = f2 * f2;
+                            let diff = f1_sq - f2_sq;
+                            let tec = 1.1839e-10 * (f1_sq * f2_sq / diff) * (theta1 / f1 - theta2 / f2);
+                            self.current_tec = tec.abs();
+                        }
+                    } else {
+                        self.frequency = freq_to_use + ch_freq_offset;
+                        self.current_tec = 0.0;
+                    }
                 } else {
                     if let Some(prev_i) = bank.active_idx {
                         bank.in_fade = true;
@@ -1385,13 +1456,37 @@ impl DemodChannel {
                             // Ungate bootstrap so re-acquisition can fire on next block
                             self.pll_tracker.is_locked = false;
                             self.ever_locked = false;
+                            self.current_tec = 0.0;
                         } else {
                             let tracker = &bank.trackers[prev_i];
                             let ch_freq_offset = (tracker.x[1] / scale) / (2.0 * std::f64::consts::PI);
                             self.is_locked = true;
                             self.symbol_locked = true;
-                            self.frequency = freq_to_use + ch_freq_offset;
                             self.phase = tracker.x[0] / scale;
+
+                            if self.is_dual {
+                                let f1 = self.target_freq;
+                                let f2 = self.target_freq2;
+                                let fd1 = ch_freq_offset;
+                                let fd2 = (tracker.x[4] / scale) / (2.0 * std::f64::consts::PI);
+                                let f1_abs = f1 + fd1;
+                                let f2_abs = f2 + fd2;
+                                let f_free = AppletonHartreeDispersion::cancel(self.nominal_freq, self.frequency2, f1_abs, f2_abs);
+                                self.frequency = f_free;
+
+                                let theta1 = tracker.x[0];
+                                let theta2 = tracker.x[3];
+                                if f1 != 0.0 && f2 != 0.0 && (f1 - f2).abs() > 1e-6 {
+                                    let f1_sq = f1 * f1;
+                                    let f2_sq = f2 * f2;
+                                    let diff = f1_sq - f2_sq;
+                                    let tec = 1.1839e-10 * (f1_sq * f2_sq / diff) * (theta1 / f1 - theta2 / f2);
+                                    self.current_tec = tec.abs();
+                                }
+                            } else {
+                                self.frequency = freq_to_use + ch_freq_offset;
+                                self.current_tec = 0.0;
+                            }
                         }
                     } else {
                         self.is_locked = false;
@@ -1399,14 +1494,22 @@ impl DemodChannel {
                         // No active tracker and no fade — ungate bootstrap for re-acquisition
                         self.pll_tracker.is_locked = false;
                         self.ever_locked = false;
+                        self.current_tec = 0.0;
                     }
                 }
             } else {
                 // Single EKF / Gardner loop execution
                 let mut symbols = Vec::with_capacity(4); // Pre-allocate outside hot loop
-                for &s in &self.decimated_samples {
+                for (s_idx, &s) in self.decimated_samples.iter().enumerate() {
                     if self.pll_tracker.is_locked {
-                        if (self.pll_tracker.ts - decimated_ts).abs() > 1e-9 {
+                        if self.is_dual {
+                            let s2 = self.decimated_samples2[s_idx];
+                            let prev_ts = self.pll_tracker.ts;
+                            self.pll_tracker.ts = decimated_ts;
+                            self.pll_tracker.predict();
+                            self.pll_tracker.update_dual(s, s2);
+                            self.pll_tracker.ts = prev_ts;
+                        } else if self.modulation != Modulation::Carrier && (self.pll_tracker.ts - decimated_ts).abs() > 1e-9 {
                             let theta = self.pll_tracker.x[0] / scale;
                             let cos_theta = (-theta).cos();
                             let sin_theta = (-theta).sin();
@@ -1421,7 +1524,7 @@ impl DemodChannel {
                                 let dt_sample = decimated_ts;
                                 let true_theta =
                                     theta - (self.pll_tracker.x[1] / scale) * (3.0 - mu as f64) * dt_sample;
-                                let cos_inv = true_theta.cos();
+                                  let cos_inv = true_theta.cos();
                                 let sin_inv = true_theta.sin();
                                 let sym_raw = Complex::new(
                                     (sym_derot.re as f64 * cos_inv - sym_derot.im as f64 * sin_inv)
@@ -1449,11 +1552,35 @@ impl DemodChannel {
 
                 self.is_locked = self.pll_tracker.is_locked;
                 self.symbol_locked = self.is_locked;
-                self.frequency =
-                    freq_to_use + ((self.pll_tracker.x[1] / scale) / (2.0 * std::f64::consts::PI));
                 self.phase = self.pll_tracker.x[0] / scale;
                 if self.is_locked {
                     self.ever_locked = true;
+                    if self.is_dual {
+                        let f1 = self.target_freq;
+                        let f2 = self.target_freq2;
+                        let fd1 = (self.pll_tracker.x[1] / scale) / (2.0 * std::f64::consts::PI);
+                        let fd2 = (self.pll_tracker.x[4] / scale) / (2.0 * std::f64::consts::PI);
+                        let f1_abs = f1 + fd1;
+                        let f2_abs = f2 + fd2;
+                        let f_free = AppletonHartreeDispersion::cancel(self.nominal_freq, self.frequency2, f1_abs, f2_abs);
+                        self.frequency = f_free;
+
+                        let theta1 = self.pll_tracker.x[0];
+                        let theta2 = self.pll_tracker.x[3];
+                        if f1 != 0.0 && f2 != 0.0 && (f1 - f2).abs() > 1e-6 {
+                            let f1_sq = f1 * f1;
+                            let f2_sq = f2 * f2;
+                            let diff = f1_sq - f2_sq;
+                            let tec = 1.1839e-10 * (f1_sq * f2_sq / diff) * (theta1 / f1 - theta2 / f2);
+                            self.current_tec = tec.abs();
+                        }
+                    } else {
+                        self.frequency = freq_to_use + ((self.pll_tracker.x[1] / scale) / (2.0 * std::f64::consts::PI));
+                        self.current_tec = 0.0;
+                    }
+                } else {
+                    self.frequency = freq_to_use;
+                    self.current_tec = 0.0;
                 }
             }
 
@@ -1489,8 +1616,7 @@ impl DemodChannel {
 
     pub fn reset_to_idle(&mut self) {
         self.sat_name.clear();
-        self.elements = None;
-        self.constants = None;
+        self.orbit = None;
         self.status = ChannelStatus::Idle;
         self.target_freq = 0.0;
         self.initial_freq = 0.0;

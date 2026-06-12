@@ -96,6 +96,7 @@ pub struct VisibleSat {
     pub az: f64,
     pub el: f64,
     pub freq_expected: f64,
+    pub freq_expected2: f64,
     pub range: f64,
     pub pass_progress: f64,
 }
@@ -113,6 +114,8 @@ pub struct ChannelTelemetry {
     pub freq_offset: f64,
     pub doppler_rate: f64,
     pub snr_db: f32,
+    pub tec: f64,
+    pub is_dual: bool,
 }
 
 pub struct TuiManager {
@@ -237,7 +240,7 @@ impl TuiManager {
         current_freq: f64,
         active_profile_name: &str,
         _active_guided_window: f64,
-        _satellites: &[(String, sgp4::Elements)],
+        _satellites: &[(String, crate::orbit::OrbitModel)],
         _buffer_len: usize,
         _last_action: &str,
         agc: bool,
@@ -631,6 +634,7 @@ impl TuiManager {
                     Cell::from(if ch.status == "IDLE" { "---".to_string() } else { format!("{:+.1} Hz", ch.freq_offset) }),
                     Cell::from(if ch.status == "IDLE" { "---".to_string() } else { format!("{:+.1} Hz/s", ch.doppler_rate) }),
                     Cell::from(if ch.status == "IDLE" { "---".to_string() } else { format!("{:.1} dB", ch.snr_db) }),
+                    Cell::from(if ch.status == "IDLE" || !ch.is_dual { "---".to_string() } else { format!("{:.2} TECU", ch.tec) }),
                 ]);
                 channel_rows.push(row);
             }
@@ -643,18 +647,20 @@ impl TuiManager {
                 Cell::from("Offset").style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)),
                 Cell::from("Doppler Rate").style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)),
                 Cell::from("SNR").style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)),
+                Cell::from("TEC").style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)),
             ]);
 
             let ch_table = Table::new(
                 channel_rows,
                 [
+                    Constraint::Percentage(10),
+                    Constraint::Percentage(20),
                     Constraint::Percentage(12),
-                    Constraint::Percentage(24),
-                    Constraint::Percentage(16),
-                    Constraint::Percentage(16),
+                    Constraint::Percentage(14),
                     Constraint::Percentage(12),
                     Constraint::Percentage(12),
                     Constraint::Percentage(8),
+                    Constraint::Percentage(12),
                 ]
             )
             .header(ch_header)

@@ -48,6 +48,10 @@ pub struct Args {
     #[arg(short = 'f', long = "frequency", default_value_t = 150800000.0)]
     frequency: f64,
 
+    /// Optional: Secondary center frequency in Hz for dual-frequency tracking and TEC calculations
+    #[arg(long = "frequency2")]
+    frequency2: Option<f64>,
+
     /// Sample rate in Hz
     #[arg(short = 's', long = "sample-rate", default_value_t = 2000000.0)]
     sample_rate: f64,
@@ -439,7 +443,7 @@ fn get_profile_by_frequency(freq: f64) -> &'static Profile {
 
 struct RiseScheduleRequest {
     step_time: DateTime<Utc>,
-    satellites: Vec<(String, sgp4::Elements)>,
+    satellites: Vec<(String, crate::orbit::OrbitModel)>,
     observer_pos: [f64; 3],
     active_max_range: f64,
 }
@@ -458,7 +462,7 @@ enum TleDownloadResult {
     Success {
         tle_path: String,
         profile_name: String,
-        satellites: Vec<(String, sgp4::Elements)>,
+        satellites: Vec<(String, crate::orbit::OrbitModel)>,
     },
     Error {
         profile_name: String,
@@ -501,7 +505,7 @@ fn check_and_save_pass_steering(
                 log_msg!(tui_manager, "[Scheduler] Saved pass data to {}", filename);
 
                 // Spawn background thread to perform fitting, steering and solver check non-blockingly
-                let elements_clone = ch.elements.clone();
+                let orbit_clone = ch.orbit.clone();
                 let downsampled_clone = downsampled.clone();
                 let initial_freq = ch.initial_freq;
                 let pos_obs = wgs84_to_ecef(args.lat, args.lon, args.alt);
@@ -514,28 +518,26 @@ fn check_and_save_pass_steering(
                 let solver_tx_clone = solver_tx.clone();
 
                 std::thread::spawn(move || {
-                    if let Some(elements) = elements_clone {
-                        if let Ok(constants) = sgp4::Constants::from_elements(&elements) {
-                            let measured_pca_time =
-                                match estimate_measured_pca_time(&downsampled_clone) {
-                                    Some(t) => t,
-                                    None => {
-                                        if !downsampled_clone.is_empty() {
-                                            downsampled_clone[downsampled_clone.len() / 2].0
-                                        } else {
-                                            chrono::Utc::now()
-                                        }
+                    if let Some(ref orbit) = orbit_clone {
+                        let measured_pca_time =
+                            match estimate_measured_pca_time(&downsampled_clone) {
+                                Some(t) => t,
+                                None => {
+                                    if !downsampled_clone.is_empty() {
+                                        downsampled_clone[downsampled_clone.len() / 2].0
+                                    } else {
+                                        chrono::Utc::now()
                                     }
-                                };
+                                }
+                            };
 
-                            if let Some((dt, df, rmse)) = fit_satellite(
-                                &constants,
-                                &elements,
-                                &downsampled_clone,
-                                pos_obs,
-                                initial_freq,
-                                measured_pca_time,
-                            ) {
+                        if let Some((dt, df, rmse)) = fit_satellite(
+                            orbit,
+                            &downsampled_clone,
+                            pos_obs,
+                            initial_freq,
+                            measured_pca_time,
+                        ) {
                                 if rmse < 100.0 {
                                     tracing::info!(
                                         "[LEODO] Fit success: dt={:.3}s, df={:.2} Hz, RMSE={:.2} Hz",
@@ -564,7 +566,6 @@ fn check_and_save_pass_steering(
                                 }
                             }
                         }
-                    }
 
                     // Check if enough passes exist to run the multi-pass location solver
                     tracing::info!("[Solver] Checking passes in {} for solve...", output_dir);
@@ -690,7 +691,11 @@ fn main() {
         }
     }
 
-    let mut current_freq = args.frequency;
+    let mut current_freq = if let Some(f2) = args.frequency2 {
+        (args.frequency + f2) / 2.0
+    } else {
+        args.frequency
+    };
     let mut tle_path = args
         .tle
         .clone()
@@ -808,10 +813,10 @@ fn main() {
     }
 
     let mut satellites = if std::path::Path::new(&tle_path).exists() {
-        match parse_tle_file(&tle_path) {
+        match load_orbits(&tle_path) {
             Ok(sats) => {
                 eprintln!(
-                    "Loaded {} satellites from TLE database for guided tracking.",
+                    "Loaded {} satellites from ephemeris database for guided tracking.",
                     sats.len()
                 );
                 sats
@@ -872,19 +877,17 @@ fn main() {
     // If simulation mode, generate raw IQ bytes and output to stdout
     if args.simulate {
         let satellites =
-            parse_tle_file(&tle_path).expect("Failed to parse TLE file for simulation");
+            load_orbits(&tle_path).expect("Failed to parse ephemeris file for simulation");
         if satellites.is_empty() {
-            eprintln!("No satellites found in TLE file");
+            eprintln!("No satellites found in ephemeris file");
             std::process::exit(1);
         }
 
-        let (_sat_name, elements) = &satellites[0];
-        let constants =
-            sgp4::Constants::from_elements(elements).expect("Failed to initialize SGP4 constants");
+        let (_sat_name, orbit) = &satellites[0];
 
         // Find PCA time
         let pca_time =
-            find_pca_time(&constants, elements, pos_obs, elements.datetime.and_utc()).expect("Failed to find PCA time");
+            find_pca_time(orbit, pos_obs, orbit.epoch()).expect("Failed to find PCA time");
 
         // Sim parameters: 90.0 seconds centered at PCA
         let duration_secs = 90.0;
@@ -895,49 +898,43 @@ fn main() {
         let start_utc_time = pca_time - chrono::Duration::microseconds((45.0 * 1e6) as i64);
 
         let mut stdout = io::stdout();
-        let mut phase = 0.0f64;
+        let f_c1 = args.frequency;
+        let f_c2 = args.frequency2.unwrap_or(0.0);
+        let is_dual_sim = f_c2 != 0.0;
+
+        let mut phase1 = 0.0f64;
+        let mut phase2 = 0.0f64;
 
         // Pre-propagate frequency values every 1000 samples (0.5 ms)
         let step = 1000;
         let num_steps = total_samples / step;
         let mut freq_steps = Vec::with_capacity(num_steps + 1);
+        let mut freq_steps2 = Vec::with_capacity(num_steps + 1);
 
         for s in 0..=num_steps {
             let sample_idx = s * step;
             let t = (sample_idx as f64) / sample_rate;
             let dt = start_utc_time + chrono::Duration::microseconds((t * 1e6) as i64);
 
-            let duration_since_epoch = dt.naive_utc().signed_duration_since(elements.datetime);
-            let mins_since_epoch = duration_since_epoch.num_milliseconds() as f64 / 60000.0;
-
-            let offset = if let Ok(prediction) =
-                constants.propagate(sgp4::MinutesSinceEpoch(mins_since_epoch))
-            {
-                let pos_teme = [
-                    prediction.position[0] * 1000.0,
-                    prediction.position[1] * 1000.0,
-                    prediction.position[2] * 1000.0,
-                ];
-                let vel_teme = [
-                    prediction.velocity[0] * 1000.0,
-                    prediction.velocity[1] * 1000.0,
-                    prediction.velocity[2] * 1000.0,
-                ];
-                let jd = datetime_to_jd(dt);
-                let (pos_sat, vel_sat) = teme_to_ecef(jd, pos_teme, vel_teme);
-
+            let (offset1, offset2) = if let Some((pos_sat, vel_sat)) = orbit.propagate_ecef(dt) {
                 let rx = pos_sat[0] - pos_obs[0];
                 let ry = pos_sat[1] - pos_obs[1];
                 let rz = pos_sat[2] - pos_obs[2];
                 let range = (rx * rx + ry * ry + rz * rz).sqrt();
                 let range_rate = (rx * vel_sat[0] + ry * vel_sat[1] + rz * vel_sat[2]) / range;
 
-                let abs_freq = current_freq * (1.0 - range_rate / 299792458.0);
-                abs_freq - current_freq
+                let abs_freq1 = f_c1 * (1.0 - range_rate / 299792458.0);
+                let abs_freq2 = if is_dual_sim {
+                    f_c2 * (1.0 - range_rate / 299792458.0)
+                } else {
+                    0.0
+                };
+                (abs_freq1 - current_freq, abs_freq2 - current_freq)
             } else {
-                0.0
+                (0.0, 0.0)
             };
-            freq_steps.push(offset);
+            freq_steps.push(offset1);
+            freq_steps2.push(offset2);
         }
 
         // Generate and stream IQ bytes with realistic noise
@@ -954,8 +951,10 @@ fn main() {
         let mut bpsk_symbol = 1.0f64;
         let mut qpsk_symbol = Complex::new(1.0f32, 0.0f32);
         for s in 0..num_steps {
-            let f_start = freq_steps[s];
-            let f_end = freq_steps[s + 1];
+            let f_start1 = freq_steps[s];
+            let f_end1 = freq_steps[s + 1];
+            let f_start2 = freq_steps2[s];
+            let f_end2 = freq_steps2[s + 1];
 
             for k in 0..step {
                 let sample_idx = s * step + k;
@@ -979,19 +978,26 @@ fn main() {
                 }
 
                 let alpha = (k as f64) / (step as f64);
-                let f = f_start + alpha * (f_end - f_start);
+                let f1 = f_start1 + alpha * (f_end1 - f_start1);
+                let f2 = f_start2 + alpha * (f_end2 - f_start2);
 
-                phase += 2.0 * std::f64::consts::PI * f / sample_rate;
+                phase1 += 2.0 * std::f64::consts::PI * f1 / sample_rate;
+                let i_sig1 = phase1.cos();
+                let q_sig1 = phase1.sin();
 
-                let i_sig = phase.cos();
-                let q_sig = phase.sin();
-
-                let (sig_i, sig_q) = match args.modulation {
-                    Modulation::Carrier => (12.0 * i_sig, 12.0 * q_sig),
-                    Modulation::Bpsk => (12.0 * i_sig * bpsk_symbol, 12.0 * q_sig * bpsk_symbol),
-                    Modulation::Qpsk => {
-                        let sig_c = Complex::new(i_sig as f32, q_sig as f32) * qpsk_symbol;
-                        (12.0 * sig_c.re as f64, 12.0 * sig_c.im as f64)
+                let (sig_i, sig_q) = if is_dual_sim {
+                    phase2 += 2.0 * std::f64::consts::PI * f2 / sample_rate;
+                    let i_sig2 = phase2.cos();
+                    let q_sig2 = phase2.sin();
+                    (6.0 * (i_sig1 + i_sig2), 6.0 * (q_sig1 + q_sig2))
+                } else {
+                    match args.modulation {
+                        Modulation::Carrier => (12.0 * i_sig1, 12.0 * q_sig1),
+                        Modulation::Bpsk => (12.0 * i_sig1 * bpsk_symbol, 12.0 * q_sig1 * bpsk_symbol),
+                        Modulation::Qpsk => {
+                            let sig_c = Complex::new(i_sig1 as f32, q_sig1 as f32) * qpsk_symbol;
+                            (12.0 * sig_c.re as f64, 12.0 * sig_c.im as f64)
+                        }
                     }
                 };
 
@@ -1064,51 +1070,26 @@ fn main() {
             let mut earliest_rise_time: Option<DateTime<Utc>> = None;
             let mut earliest_sat_name = String::new();
 
-            for (name, elements) in &req.satellites {
-                if let Ok(constants) = sgp4::Constants::from_elements(elements) {
-                    let duration_since_epoch = req
-                        .step_time
-                        .naive_utc()
-                        .signed_duration_since(elements.datetime);
-                    let base_mins = duration_since_epoch.num_milliseconds() as f64 / 60000.0;
+            for (name, orbit) in &req.satellites {
+                // Check every 1 minute for the next 12 hours (720 minutes)
+                for offset_mins in 0..720 {
+                    let check_time = req.step_time + chrono::Duration::minutes(offset_mins);
+                    if let Some((pos_sat, _)) = orbit.propagate_ecef(check_time) {
+                        let rx = pos_sat[0] - req.observer_pos[0];
+                        let ry = pos_sat[1] - req.observer_pos[1];
+                        let rz = pos_sat[2] - req.observer_pos[2];
+                        let range = (rx * rx + ry * ry + rz * rz).sqrt();
 
-                    // Check every 1 minute for the next 12 hours (720 minutes)
-                    for offset_mins in 0..720 {
-                        let check_time = req.step_time + chrono::Duration::minutes(offset_mins);
-                        let mins_since_epoch = base_mins + offset_mins as f64;
-
-                        if let Ok(prediction) =
-                            constants.propagate(sgp4::MinutesSinceEpoch(mins_since_epoch))
-                        {
-                            let pos_teme = [
-                                prediction.position[0] * 1000.0,
-                                prediction.position[1] * 1000.0,
-                                prediction.position[2] * 1000.0,
-                            ];
-                            let vel_teme = [
-                                prediction.velocity[0] * 1000.0,
-                                prediction.velocity[1] * 1000.0,
-                                prediction.velocity[2] * 1000.0,
-                            ];
-                            let jd = datetime_to_jd(check_time);
-                            let (pos_sat, _) = teme_to_ecef(jd, pos_teme, vel_teme);
-
-                            let rx = pos_sat[0] - req.observer_pos[0];
-                            let ry = pos_sat[1] - req.observer_pos[1];
-                            let rz = pos_sat[2] - req.observer_pos[2];
-                            let range = (rx * rx + ry * ry + rz * rz).sqrt();
-
-                            if range < req.active_max_range {
-                                let is_earlier = match earliest_rise_time {
-                                    None => true,
-                                    Some(prev_time) => check_time < prev_time,
-                                };
-                                if is_earlier {
-                                    earliest_rise_time = Some(check_time);
-                                    earliest_sat_name = name.clone();
-                                }
-                                break;
+                        if range < req.active_max_range {
+                            let is_earlier = match earliest_rise_time {
+                                None => true,
+                                Some(prev_time) => check_time < prev_time,
+                            };
+                            if is_earlier {
+                                earliest_rise_time = Some(check_time);
+                                earliest_sat_name = name.clone();
                             }
+                            break;
                         }
                     }
                 }
@@ -1136,7 +1117,7 @@ fn main() {
         while let Ok(req) = tle_download_rx.recv() {
             let urls_refs: Vec<&str> = req.urls.iter().map(|s| s.as_str()).collect();
             match get_tle_file_cached(&urls_refs, &req.tle_path, false) {
-                Ok(_) => match parse_tle_file(&req.tle_path) {
+                Ok(_) => match load_orbits(&req.tle_path) {
                     Ok(new_sats) => {
                         let _ = tle_download_resp_tx.send(TleDownloadResult::Success {
                             tle_path: req.tle_path,
@@ -1210,133 +1191,81 @@ fn main() {
             };
 
             let current_time = chrono::Utc::now();
-            let jd = datetime_to_jd(current_time);
             let pos_obs = wgs84_to_ecef(plot_lat, plot_lon, observer_alt);
 
             let mut next_visible = Vec::new();
-            for (name, elements) in &sats {
-                if let Ok(constants) = sgp4::Constants::from_elements(elements) {
-                    let duration_since_epoch = current_time
-                        .naive_utc()
-                        .signed_duration_since(elements.datetime);
-                    let mins_since_epoch = duration_since_epoch.num_milliseconds() as f64 / 60000.0;
-                    if let Ok(prediction) =
-                        constants.propagate(sgp4::MinutesSinceEpoch(mins_since_epoch))
-                    {
-                        let pos_teme = [
-                            prediction.position[0] * 1000.0,
-                            prediction.position[1] * 1000.0,
-                            prediction.position[2] * 1000.0,
-                        ];
-                        let vel_teme = [
-                            prediction.velocity[0] * 1000.0,
-                            prediction.velocity[1] * 1000.0,
-                            prediction.velocity[2] * 1000.0,
-                        ];
-                        let (pos_sat, vel_sat) = teme_to_ecef(jd, pos_teme, vel_teme);
+            for (name, orbit) in &sats {
+                if let Some((pos_sat, vel_sat)) = orbit.propagate_ecef(current_time) {
+                    let enu = ecef_to_enu(pos_sat, pos_obs);
+                    let (az, el) = enu_to_az_el(enu);
 
-                        let enu = ecef_to_enu(pos_sat, pos_obs);
-                        let (az, el) = enu_to_az_el(enu);
+                    if el > 0.0 {
+                        let rx = pos_sat[0] - pos_obs[0];
+                        let ry = pos_sat[1] - pos_obs[1];
+                        let rz = pos_sat[2] - pos_obs[2];
+                        let range = (rx * rx + ry * ry + rz * rz).sqrt();
+                        if range < max_range {
+                            let range_rate =
+                                (rx * vel_sat[0] + ry * vel_sat[1] + rz * vel_sat[2]) / range;
+                            let freq_expected = cur_freq * (1.0 - range_rate / 299792458.0);
+                            let freq2 = args.frequency2.unwrap_or(0.0);
+                            let freq_expected2 = if freq2 != 0.0 {
+                                freq2 * (1.0 - range_rate / 299792458.0)
+                            } else {
+                                0.0
+                            };
 
-                        if el > 0.0 {
-                            let rx = pos_sat[0] - pos_obs[0];
-                            let ry = pos_sat[1] - pos_obs[1];
-                            let rz = pos_sat[2] - pos_obs[2];
-                            let range = (rx * rx + ry * ry + rz * rz).sqrt();
-                            if range < max_range {
-                                let range_rate =
-                                    (rx * vel_sat[0] + ry * vel_sat[1] + rz * vel_sat[2]) / range;
-                                let freq_expected = cur_freq * (1.0 - range_rate / 299792458.0);
-
-                                // Find rise time and set time for this pass
-                                let mut rise_time = current_time;
-                                for step in 1..=40 {
-                                    let t_back =
-                                        current_time - chrono::Duration::seconds(step * 30);
-                                    let mins_back = (t_back.naive_utc() - elements.datetime)
-                                        .num_milliseconds()
-                                        as f64
-                                        / 60000.0;
-                                    if let Ok(pred_back) =
-                                        constants.propagate(sgp4::MinutesSinceEpoch(mins_back))
-                                    {
-                                        let pos_teme_back = [
-                                            pred_back.position[0] * 1000.0,
-                                            pred_back.position[1] * 1000.0,
-                                            pred_back.position[2] * 1000.0,
-                                        ];
-                                        let vel_teme_back = [
-                                            pred_back.velocity[0] * 1000.0,
-                                            pred_back.velocity[1] * 1000.0,
-                                            pred_back.velocity[2] * 1000.0,
-                                        ];
-                                        let jd_back = datetime_to_jd(t_back);
-                                        let (pos_sat_back, _) =
-                                            teme_to_ecef(jd_back, pos_teme_back, vel_teme_back);
-                                        let enu_back = ecef_to_enu(pos_sat_back, pos_obs);
-                                        let (_, el_back) = enu_to_az_el(enu_back);
-                                        if el_back <= 0.0 {
-                                            rise_time = t_back;
-                                            break;
-                                        }
+                            // Find rise time and set time for this pass
+                            let mut rise_time = current_time;
+                            for step in 1..=40 {
+                                let t_back =
+                                    current_time - chrono::Duration::seconds(step * 30);
+                                if let Some((pos_sat_back, _)) = orbit.propagate_ecef(t_back) {
+                                    let enu_back = ecef_to_enu(pos_sat_back, pos_obs);
+                                    let (_, el_back) = enu_to_az_el(enu_back);
+                                    if el_back <= 0.0 {
+                                        rise_time = t_back;
+                                        break;
                                     }
                                 }
-                                if rise_time == current_time {
-                                    rise_time = current_time - chrono::Duration::minutes(10);
-                                }
-
-                                let mut set_time = current_time;
-                                for step in 1..=40 {
-                                    let t_fwd = current_time + chrono::Duration::seconds(step * 30);
-                                    let mins_fwd = (t_fwd.naive_utc() - elements.datetime)
-                                        .num_milliseconds()
-                                        as f64
-                                        / 60000.0;
-                                    if let Ok(pred_fwd) =
-                                        constants.propagate(sgp4::MinutesSinceEpoch(mins_fwd))
-                                    {
-                                        let pos_teme_fwd = [
-                                            pred_fwd.position[0] * 1000.0,
-                                            pred_fwd.position[1] * 1000.0,
-                                            pred_fwd.position[2] * 1000.0,
-                                        ];
-                                        let vel_teme_fwd = [
-                                            pred_fwd.velocity[0] * 1000.0,
-                                            pred_fwd.velocity[1] * 1000.0,
-                                            pred_fwd.velocity[2] * 1000.0,
-                                        ];
-                                        let jd_fwd = datetime_to_jd(t_fwd);
-                                        let (pos_sat_fwd, _) =
-                                            teme_to_ecef(jd_fwd, pos_teme_fwd, vel_teme_fwd);
-                                        let enu_fwd = ecef_to_enu(pos_sat_fwd, pos_obs);
-                                        let (_, el_fwd) = enu_to_az_el(enu_fwd);
-                                        if el_fwd <= 0.0 {
-                                            set_time = t_fwd;
-                                            break;
-                                        }
-                                    }
-                                }
-                                if set_time == current_time {
-                                    set_time = current_time + chrono::Duration::minutes(10);
-                                }
-
-                                let total_dur = (set_time - rise_time).num_seconds() as f64;
-                                let elapsed = (current_time - rise_time).num_seconds() as f64;
-                                let pass_progress = if total_dur > 0.0 {
-                                    (elapsed / total_dur).clamp(0.0, 1.0)
-                                } else {
-                                    0.0
-                                };
-
-                                next_visible.push(VisibleSat {
-                                    name: name.clone(),
-                                    az,
-                                    el,
-                                    freq_expected,
-                                    range,
-                                    pass_progress,
-                                });
                             }
+                            if rise_time == current_time {
+                                rise_time = current_time - chrono::Duration::minutes(10);
+                            }
+
+                            let mut set_time = current_time;
+                            for step in 1..=40 {
+                                let t_fwd = current_time + chrono::Duration::seconds(step * 30);
+                                if let Some((pos_sat_fwd, _)) = orbit.propagate_ecef(t_fwd) {
+                                    let enu_fwd = ecef_to_enu(pos_sat_fwd, pos_obs);
+                                    let (_, el_fwd) = enu_to_az_el(enu_fwd);
+                                    if el_fwd <= 0.0 {
+                                        set_time = t_fwd;
+                                        break;
+                                    }
+                                }
+                            }
+                            if set_time == current_time {
+                                set_time = current_time + chrono::Duration::minutes(10);
+                            }
+
+                            let total_dur = (set_time - rise_time).num_seconds() as f64;
+                            let elapsed = (current_time - rise_time).num_seconds() as f64;
+                            let pass_progress = if total_dur > 0.0 {
+                                (elapsed / total_dur).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            };
+
+                            next_visible.push(VisibleSat {
+                                name: name.clone(),
+                                az,
+                                el,
+                                freq_expected,
+                                freq_expected2,
+                                range,
+                                pass_progress,
+                            });
                         }
                     }
                 }
@@ -1354,6 +1283,7 @@ fn main() {
                         let _ = channel_cmd_tx_clone.send(ChannelCommand::UpdateTargetFrequency {
                             channel_index: ch_idx,
                             target_freq: sat.freq_expected,
+                            target_freq2: sat.freq_expected2,
                         });
                         handled_sats.insert(sat_name.clone());
                     } else {
@@ -1379,19 +1309,21 @@ fn main() {
                 if handled_sats.contains(&sat.name) {
                     continue;
                 }
-                if let Some(elements) = sats
+                if let Some(orbit) = sats
                     .iter()
                     .find(|(name, _)| *name == sat.name)
-                    .map(|(_, el)| el.clone())
+                    .map(|(_, orb)| orb.clone())
                 {
                     if allocator.handle_aos(&sat.name, None) {
                         let ch_idx = allocator.active_channels[&sat.name];
                         let _ = channel_cmd_tx_clone.send(ChannelCommand::Allocate {
                             channel_index: ch_idx,
                             sat_name: sat.name.clone(),
-                            elements,
+                            orbit,
                             target_freq: sat.freq_expected,
+                            target_freq2: sat.freq_expected2,
                             initial_freq: cur_freq,
+                            frequency2: args.frequency2.unwrap_or(0.0),
                         });
                         handled_sats.insert(sat.name.clone());
                     }
@@ -1422,7 +1354,15 @@ fn main() {
         let pool_tx_clone = pool_tx.clone();
         let pool_rx_clone = pool_rx.clone();
         let sample_rate = args.sample_rate;
-        let frequency = args.frequency;
+        let frequency = if let Some(f2) = args.frequency2 {
+            let span = (args.frequency - f2).abs();
+            if span >= sample_rate {
+                panic!("Error: Sample rate {} Hz is too small to cover the dual-frequency span of {} Hz without aliasing. Please increase the sample rate.", sample_rate, span);
+            }
+            (args.frequency + f2) / 2.0
+        } else {
+            args.frequency
+        };
         let gain = args.gain;
         let lna_gain = args.lna_gain;
         let amp_gain = args.amp_gain;
@@ -1548,8 +1488,16 @@ fn main() {
                     Ok(n_read) => {
                         if n_read > 0 {
                             buf.truncate(n_read);
-                            if tx_clone.send(buf).is_err() {
-                                break;
+                            if let Err(e) = tx_clone.try_send(buf) {
+                                match e {
+                                    crossbeam_channel::TrySendError::Full(b) => {
+                                        let _ = pool_tx_clone.send(b);
+                                        tracing::warn!("SDR queue full: samples dropped due to processing backlog.");
+                                    }
+                                    crossbeam_channel::TrySendError::Disconnected(_) => {
+                                        break;
+                                    }
+                                }
                             }
                         } else {
                             // Recycle the unused buffer
@@ -1654,14 +1602,10 @@ fn main() {
 
     let mut step_count = 0;
     let mut start_system_time = if args.sim_start_time && !satellites.is_empty() {
-        let (_sat_name, elements) = &satellites[0];
-        if let Ok(constants) = sgp4::Constants::from_elements(elements) {
-            if let Some(pca_time) = find_pca_time(&constants, elements, pos_obs, elements.datetime.and_utc()) {
-                let base_time = pca_time - chrono::Duration::microseconds((45.0 * 1e6) as i64);
-                base_time + chrono::Duration::microseconds((args.sim_offset * 1e6) as i64)
-            } else {
-                chrono::Utc::now()
-            }
+        let (_sat_name, orbit) = &satellites[0];
+        if let Some(pca_time) = find_pca_time(orbit, pos_obs, orbit.epoch()) {
+            let base_time = pca_time - chrono::Duration::microseconds((45.0 * 1e6) as i64);
+            base_time + chrono::Duration::microseconds((args.sim_offset * 1e6) as i64)
         } else {
             chrono::Utc::now()
         }
@@ -1669,12 +1613,8 @@ fn main() {
         chrono::Utc::now()
     };
     let mut _active_pca_time = if !satellites.is_empty() {
-        let (_sat_name, elements) = &satellites[0];
-        if let Ok(constants) = sgp4::Constants::from_elements(elements) {
-            find_pca_time(&constants, elements, pos_obs, start_system_time)
-        } else {
-            None
-        }
+        let (_sat_name, orbit) = &satellites[0];
+        find_pca_time(orbit, pos_obs, start_system_time)
     } else {
         None
     };
@@ -1715,7 +1655,7 @@ fn main() {
             args.fade_timeout,
             taps.clone(),
             decimate,
-            !args.no_eca,
+            false, // Pre-cleaned on the main thread
         ));
     }
 
@@ -1812,41 +1752,19 @@ fn main() {
     let active_min_snr = args.min_snr;
     let mut snr_db = 0.0f32;
     if !satellites.is_empty() {
-        let jd = datetime_to_jd(start_system_time);
         let mut candidates = Vec::new();
-        for (_name, elements) in &satellites {
-            if let Ok(constants) = sgp4::Constants::from_elements(elements) {
-                let duration_since_epoch = start_system_time
-                    .naive_utc()
-                    .signed_duration_since(elements.datetime);
-                let mins_since_epoch = duration_since_epoch.num_milliseconds() as f64 / 60000.0;
+        for (_name, orbit) in &satellites {
+            if let Some((pos_sat, vel_sat)) = orbit.propagate_ecef(start_system_time) {
+                let rx = pos_sat[0] - pos_obs[0];
+                let ry = pos_sat[1] - pos_obs[1];
+                let rz = pos_sat[2] - pos_obs[2];
+                let range = (rx * rx + ry * ry + rz * rz).sqrt();
 
-                if let Ok(prediction) =
-                    constants.propagate(sgp4::MinutesSinceEpoch(mins_since_epoch))
-                {
-                    let pos_teme = [
-                        prediction.position[0] * 1000.0,
-                        prediction.position[1] * 1000.0,
-                        prediction.position[2] * 1000.0,
-                    ];
-                    let vel_teme = [
-                        prediction.velocity[0] * 1000.0,
-                        prediction.velocity[1] * 1000.0,
-                        prediction.velocity[2] * 1000.0,
-                    ];
-                    let (pos_sat, vel_sat) = teme_to_ecef(jd, pos_teme, vel_teme);
-
-                    let rx = pos_sat[0] - pos_obs[0];
-                    let ry = pos_sat[1] - pos_obs[1];
-                    let rz = pos_sat[2] - pos_obs[2];
-                    let range = (rx * rx + ry * ry + rz * rz).sqrt();
-
-                    if range < active_max_range {
-                        let range_rate =
-                            (rx * vel_sat[0] + ry * vel_sat[1] + rz * vel_sat[2]) / range;
-                        let freq_expected = current_freq * (1.0 - range_rate / 299792458.0);
-                        candidates.push((range, freq_expected));
-                    }
+                if range < active_max_range {
+                    let range_rate =
+                        (rx * vel_sat[0] + ry * vel_sat[1] + rz * vel_sat[2]) / range;
+                    let freq_expected = current_freq * (1.0 - range_rate / 299792458.0);
+                    candidates.push((range, freq_expected));
                 }
             }
         }
@@ -1996,16 +1914,11 @@ fn main() {
         } else {
             "PRIMARY".to_string()
         };
-        ch.elements = if !satellites.is_empty() {
+        ch.orbit = if !satellites.is_empty() {
             Some(satellites[0].1.clone())
         } else {
             None
         };
-        if let Some(ref elements) = ch.elements {
-            if let Ok(constants) = sgp4::Constants::from_elements(elements) {
-                ch.constants = Some(constants);
-            }
-        }
         ch.target_freq = current_freq;
         ch.initial_freq = current_freq;
     }
@@ -2014,6 +1927,8 @@ fn main() {
     let mut was_tracking = false;
     let mut lost_lock_counter = 100;
     let mut mixed_scratch = vec![Complex::new(0.0f32, 0.0f32); 32768];
+    let mut main_eca_canceler = crate::dsp::EcaCanceler::new();
+    let mut eca_cleaned_samples = Vec::new();
 
     for samples in &rx {
         if !running.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2038,12 +1953,8 @@ fn main() {
                         *shared_satellites.lock().unwrap() = satellites.clone();
                         last_action = format!("TLE updated for {}", profile_name);
                         if !satellites.is_empty() {
-                            let (_sat_name, elements) = &satellites[0];
-                            if let Ok(constants) = sgp4::Constants::from_elements(elements) {
-                                _active_pca_time = find_pca_time(&constants, elements, pos_obs, chrono::Utc::now());
-                            } else {
-                                _active_pca_time = None;
-                            }
+                            let (_sat_name, orbit) = &satellites[0];
+                            _active_pca_time = find_pca_time(orbit, pos_obs, chrono::Utc::now());
                         } else {
                             _active_pca_time = None;
                         }
@@ -2184,21 +2095,22 @@ fn main() {
                 ChannelCommand::Allocate {
                     channel_index,
                     sat_name,
-                    elements,
+                    orbit,
                     target_freq,
+                    target_freq2,
                     initial_freq,
+                    frequency2,
                 } => {
                     if channel_index < channels.len() {
                         let ch = &mut channels[channel_index];
                         ch.sat_name = sat_name.clone();
-                        ch.elements = Some(elements.clone());
-                        if let Ok(constants) = sgp4::Constants::from_elements(&elements) {
-                            ch.constants = Some(constants);
-                        } else {
-                            ch.constants = None;
-                        }
+                        ch.orbit = Some(orbit);
                         ch.target_freq = target_freq;
+                        ch.target_freq2 = target_freq2;
                         ch.initial_freq = initial_freq;
+                        ch.frequency2 = frequency2;
+                        ch.is_dual = frequency2 != 0.0;
+                        ch.current_tec = 0.0;
                         ch.status = ChannelStatus::Acquisition;
                         ch.first_lock_time = None;
                         ch.last_lock_time = None;
@@ -2210,14 +2122,21 @@ fn main() {
                         ch.unlocked_frames_during_pass = 0;
                         ch.pll_tracker.is_locked = false;
                         ch.pll_tracker.lock_metric = 0.0;
+                        
+                        let ratio = if frequency2 != 0.0 && target_freq != 0.0 { frequency2 / target_freq } else { 1.0 };
+                        ch.pll_tracker.set_frequency_ratio(ratio);
+
                         // Reset DSP pipeline state to prevent stale history from previous satellite
                         ch.decimator.reset();
+                        ch.decimator2.reset();
                         ch.gardner_loop.reset();
                         ch.ddc.phase_acc = 0.0;
+                        ch.ddc2.phase_acc = 0.0;
                         if let Some(ref mut bank) = ch.tracking_bank {
                             for t in &mut bank.trackers {
                                 t.is_locked = false;
                                 t.lock_metric = 0.0;
+                                t.set_frequency_ratio(ratio);
                             }
                             bank.active_idx = None;
                             bank.in_fade = false;
@@ -2249,17 +2168,18 @@ fn main() {
                         );
                         ch.status = ChannelStatus::Idle;
                         ch.sat_name = "IDLE".to_string();
-                        ch.elements = None;
-                        ch.constants = None;
+                        ch.orbit = None;
                     }
                 }
                 ChannelCommand::UpdateTargetFrequency {
                     channel_index,
                     target_freq,
+                    target_freq2,
                 } => {
                     if channel_index < channels.len() {
                         let ch = &mut channels[channel_index];
                         ch.target_freq = target_freq;
+                        ch.target_freq2 = target_freq2;
                     }
                 }
             }
@@ -2286,7 +2206,18 @@ fn main() {
         is_valid_signal = false;
         raw_snr_db = 0.0f32;
 
-        process_pipeline_parallel(&mut channels, &samples, current_freq, args.sample_rate);
+        if eca_cleaned_samples.len() != samples.len() {
+            eca_cleaned_samples.resize(samples.len(), Complex::new(0.0f32, 0.0f32));
+        }
+
+        let samples_to_process = if !args.no_eca {
+            main_eca_canceler.process_block(&samples, &mut eca_cleaned_samples);
+            &eca_cleaned_samples
+        } else {
+            &samples
+        };
+
+        process_pipeline_parallel(&mut channels, samples_to_process, current_freq, args.sample_rate);
 
         for ch in &mut channels {
             if ch.status == ChannelStatus::Idle {
@@ -2350,8 +2281,7 @@ fn main() {
                         );
                         ch.status = ChannelStatus::Idle;
                         ch.sat_name = "IDLE".to_string();
-                        ch.elements = None;
-                        ch.constants = None;
+                        ch.orbit = None;
                         let _ = channel_feedback_tx.send(ch.id);
                     }
                 }
@@ -2833,21 +2763,15 @@ fn main() {
 
                                 // Reload satellites immediately from cached TLE if it exists, to avoid blocking
                                 if std::path::Path::new(&tle_path).exists() {
-                                    match parse_tle_file(&tle_path) {
+                                    match load_orbits(&tle_path) {
                                         Ok(sats) => {
                                             satellites = sats;
                                             last_action = format!("Switched to {}", prof.name);
                                             if !satellites.is_empty() {
-                                                let (_sat_name, elements) = &satellites[0];
-                                                if let Ok(constants) =
-                                                    sgp4::Constants::from_elements(elements)
-                                                {
-                                                    _active_pca_time = find_pca_time(
-                                                        &constants, elements, pos_obs, chrono::Utc::now(),
-                                                    );
-                                                } else {
-                                                    _active_pca_time = None;
-                                                }
+                                                let (_sat_name, orbit) = &satellites[0];
+                                                _active_pca_time = find_pca_time(
+                                                    orbit, pos_obs, chrono::Utc::now(),
+                                                );
                                             } else {
                                                 _active_pca_time = None;
                                             }
@@ -2954,6 +2878,8 @@ fn main() {
                                 freq_offset: freq_offset_val,
                                 doppler_rate: doppler_rate_val,
                                 snr_db: ch.last_snr,
+                                tec: ch.current_tec,
+                                is_dual: ch.is_dual,
                             }
                         })
                         .collect();
@@ -3072,10 +2998,10 @@ fn main() {
         }
     };
 
-    match parse_tle_file(&tle_path) {
+    match load_orbits(&tle_path) {
         Ok(satellites) => {
             println!(
-                "Loaded {} satellites from TLE file: {}",
+                "Loaded {} satellites from ephemeris file: {}",
                 satellites.len(),
                 tle_path
             );
@@ -3086,25 +3012,23 @@ fn main() {
             let mut min_rmse = f64::MAX;
 
             let total_sats = satellites.len();
-            for (idx, (name, elements)) in satellites.iter().enumerate() {
+            for (idx, (name, orbit)) in satellites.iter().enumerate() {
                 if idx % 50 == 0 {
                     eprint!(
-                        "\rScanning TLE database: {}/{} ({:.1}%) ...\x1B[K",
+                        "\rScanning ephemeris database: {}/{} ({:.1}%) ...\x1B[K",
                         idx,
                         total_sats,
                         (idx as f64 / total_sats as f64) * 100.0
                     );
                     let _ = io::stderr().flush();
                 }
-                if let Ok(constants) = sgp4::Constants::from_elements(elements)
-                    && let Some((dt, df, rmse)) = fit_satellite(
-                        &constants,
-                        elements,
-                        &downsampled,
-                        pos_obs,
-                        current_freq,
-                        measured_pca_time,
-                    )
+                if let Some((dt, df, rmse)) = fit_satellite(
+                    orbit,
+                    &downsampled,
+                    pos_obs,
+                    current_freq,
+                    measured_pca_time,
+                )
                 {
                     if rmse < 150.0 {
                         eprint!("\r\x1B[K");
@@ -3765,7 +3689,7 @@ mod tests {
         let initial_q_chirp = tracker.q_chirp;
 
         tracker.lock_metric = 1.0;
-        tracker.p = nalgebra::Matrix3::zeros();
+        tracker.p = nalgebra::Matrix6::zeros();
         tracker.predict();
 
         let dt = tracker.ts;

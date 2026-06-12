@@ -757,3 +757,56 @@ When $N \ge 4$ satellites are locked simultaneously, the receiver runs a recursi
    $$\text{GDOP} = \sqrt{\operatorname{Tr}((H^T H)^{-1})}$$
    If $\text{GDOP} > 100.0$ or the system is near-coplanar, the solution is discarded. ECEF coordinates are converted to WGS84 ellipsoid coordinates $(\phi, \lambda, h)$ via Bowring's method.
 
+### 7.5 Dual-Frequency Ionospheric Delay Cancellation & TEC Estimation
+
+To eliminate the first-order ionospheric delay and estimate the line-of-sight Total Electron Content (TEC) in real-time, the system can track a secondary carrier frequency using a coupled state space Kalman filter.
+
+#### 1. Coupled 6-State Extended Kalman Filter (CarrierPllEkf)
+For dual-frequency tracking, the state vector is expanded to a 6-state representation containing the phase, frequency, and frequency rate (chirp) of both carriers:
+$$\mathbf{x} = \begin{bmatrix} \theta_1 & \omega_1 & \alpha_1 & \theta_2 & \omega_2 & \alpha_2 \end{bmatrix}^T$$
+where index 1 denotes the primary carrier and index 2 denotes the secondary carrier, with phase $\theta_i$ (rad), angular frequency $\omega_i$ (rad/s), and angular chirp rate $\alpha_i$ (rad/s$^2$).
+
+The transition matrix $F$ is defined as:
+$$F = \begin{bmatrix}
+1 & \Delta t & \frac{1}{2}\Delta t^2 & 0 & 0 & 0 \\
+0 & 1 & \Delta t & 0 & 0 & 0 \\
+0 & 0 & 1 & 0 & 0 & 0 \\
+0 & 0 & 0 & 1 & \Delta t & \frac{1}{2}\Delta t^2 \\
+0 & 0 & 0 & 0 & 1 & \Delta t \\
+0 & 0 & 0 & 0 & 0 & 1
+\end{bmatrix}$$
+
+The process noise parameters are coupled via the nominal frequency ratio $r = f_2 / f_1$:
+$$Q = \begin{bmatrix}
+q_p & 0 & 0 & 0 & 0 & 0 \\
+0 & q_f & 0 & 0 & r q_f & 0 \\
+0 & 0 & q_c & 0 & 0 & r q_c \\
+0 & 0 & 0 & q_p & 0 & 0 \\
+0 & r q_f & 0 & 0 & r^2 q_f & 0 \\
+0 & 0 & r q_c & 0 & 0 & r^2 q_c
+\end{bmatrix} \cdot s_m \Delta t$$
+where:
+- $q_p, q_f, q_c$ are the process noise intensities for phase, frequency, and chirp.
+- $s_m = 1.0 - 0.9 \cdot M_{\text{lock}}$ is the adaptive process noise scaling factor based on the lock metric.
+- $r = f_2 / f_1$ is the nominal frequency ratio.
+
+Cross-coupling terms $Q_{(1,4)} = Q_{(4,1)} = r q_f$ and $Q_{(2,5)} = Q_{(5,2)} = r q_c$ represent the physical correlation between the Doppler shifts and drift rates of the two carriers since they undergo identical geometric line-of-sight acceleration.
+
+#### 2. Appleton-Hartree Dispersion Cancellation
+Ground delay and phase advance in the ionosphere are dispersive, depending inversely on the square of the carrier frequency ($1/f^2$). The absolute tracked carrier frequencies are:
+$$f_{1,\text{abs}} = f_1 + \frac{\omega_1}{2\pi}, \quad f_{2,\text{abs}} = f_2 + \frac{\omega_2}{2\pi}$$
+where $f_1$ and $f_2$ are the nominal frequencies. The receiver cancels first-order ionospheric dispersion by forming the ionosphere-free linear combination of the absolute frequencies:
+$$f_{\text{free}} = \frac{f_1^2 f_{1,\text{abs}} - f_2^2 f_{2,\text{abs}}}{f_1^2 - f_2^2}$$
+If the frequency difference $|f_1 - f_2| < 10^{-6}\text{ Hz}$, the system falls back to $f_{\text{free}} = f_{1,\text{abs}}$.
+
+#### 3. Total Electron Content (TEC) Calculation
+The phase advance due to the ionosphere is measured by comparing the tracked phases of the two carriers:
+$$\theta_1 = 2\pi f_1 \left(t - \frac{\rho}{c}\right) + \frac{K_{\text{tec}} \cdot \text{TEC}}{f_1}$$
+$$\theta_2 = 2\pi f_2 \left(t - \frac{\rho}{c}\right) + \frac{K_{\text{tec}} \cdot \text{TEC}}{f_2}$$
+where $K_{\text{tec}} = \frac{2\pi \cdot 40.3}{c}$. By comparing the phases, we extract the Total Electron Content (TEC):
+$$\text{TEC} = \frac{f_1^2 f_2^2}{K_{\text{tec}} (f_1^2 - f_2^2)} \left(\frac{\theta_1}{f_1} - \frac{\theta_2}{f_2}\right)$$
+Expressed in TEC Units (TECU, where $1 \text{ TECU} = 10^{16} \text{ electrons/m}^2$), we apply the constant coefficient:
+$$C_{\text{tec}} = \frac{c}{2\pi \cdot 40.3 \cdot 10^{16}} \approx 1.1839 \times 10^{-10}$$
+$$\text{TEC (TECU)} = \left| 1.1839 \times 10^{-10} \cdot \left(\frac{f_1^2 f_2^2}{f_1^2 - f_2^2}\right) \cdot \left(\frac{\theta_1}{f_1} - \frac{\theta_2}{f_2}\right) \right|$$
+
+
