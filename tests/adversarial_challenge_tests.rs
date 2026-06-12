@@ -259,7 +259,12 @@ fn test_ekf_update_nan_sample() {
     let mut ekf_filter = ekf::CarrierPllEkf::new(10000.0, dsp::Modulation::Carrier);
     ekf_filter.reset(0.0, 100.0, 0.0);
     ekf_filter.update(Complex::new(f32::NAN, f32::NAN));
-    assert!(ekf_filter.x[0].is_nan() || ekf_filter.x[1].is_nan() || ekf_filter.x[2].is_nan());
+    // A3: NaN guard now resets state instead of propagating NaN.
+    // State should be finite (zeroed) and tracker should be unlocked.
+    assert!(ekf_filter.x.iter().all(|v| v.is_finite()),
+        "EKF state should be finite after NaN input (NaN guard should have reset it)");
+    assert!(!ekf_filter.is_locked,
+        "EKF should be unlocked after NaN-triggered reset");
 }
 
 // --- Vladimirov-Steered Envelope Wavelet Gaps ---

@@ -404,7 +404,6 @@ pub fn fit_orbit_doppler(
     let mut best_u0 = 0.0_f64;
     let mut best_rss = f64::MAX;
 
-    let mut rng = SimpleRng::new(1337);
 
     // 12x12 grid of starting points for Langevin trajectories (30 degree spacing)
     let mut grid_points = [0.0; 12];
@@ -753,14 +752,17 @@ pub fn fit_orbit_doppler(
         }
 
         if let Some(delta) = solve_linear_system(&mut jt_j, &jt_r) {
-            let mut step_len = 0.0;
             for k in 0..8 {
                 stage1_params[k] -= delta[k];
-                step_len += delta[k] * delta[k];
             }
             stage1_params[0] = stage1_params[0].max(6500e3).min(20000e3);
             stage1_params[1] = stage1_params[1].max(0.0).min(std::f64::consts::PI);
-            if step_len.sqrt() < 1e-6 {
+            // Scale-aware convergence: check relative step size per parameter.
+            let max_rel_step = (0..8).map(|k| {
+                let denom = stage1_params[k].abs().max(1e-10);
+                delta[k].abs() / denom
+            }).fold(0.0f64, f64::max);
+            if max_rel_step < 1e-8 {
                 break;
             }
         } else {
@@ -833,6 +835,13 @@ pub fn fit_orbit_doppler(
             let dt = params[4 + 4 * p_idx];
             residuals.push(dt * 10.0);
         }
+        // Regularize df1 and df2 toward zero to prevent overfitting on short passes.
+        for p_idx in 0..raw_passes.len() {
+            let df1 = params[4 + 4 * p_idx + 2];
+            let df2 = params[4 + 4 * p_idx + 3];
+            residuals.push(df1 * 100.0);    // Penalize linear drift
+            residuals.push(df2 * 10000.0);  // Penalize quadratic drift more strongly
+        }
 
         let rss: f64 = residuals.iter().map(|r| r * r).sum();
         if rss < best_rss {
@@ -874,6 +883,13 @@ pub fn fit_orbit_doppler(
             for p_idx in 0..raw_passes.len() {
                 let dt = params[4 + 4 * p_idx];
                 residuals.push(dt * 10.0);
+            }
+            // Regularize df1 and df2 toward zero to prevent overfitting on short passes.
+            for p_idx in 0..raw_passes.len() {
+                let df1 = params[4 + 4 * p_idx + 2];
+                let df2 = params[4 + 4 * p_idx + 3];
+                residuals.push(df1 * 100.0);    // Penalize linear drift
+                residuals.push(df2 * 10000.0);  // Penalize quadratic drift more strongly
             }
         }
 
@@ -934,6 +950,16 @@ pub fn fit_orbit_doppler(
                 jacobian[row_idx][k] = (diff - residuals[row_idx]) / param_eps;
                 row_idx += 1;
             }
+            for p_idx in 0..raw_passes.len() {
+                let df1 = perturbed[4 + 4 * p_idx + 2];
+                let df2 = perturbed[4 + 4 * p_idx + 3];
+                let diff_df1 = df1 * 100.0;
+                let diff_df2 = df2 * 10000.0;
+                jacobian[row_idx][k] = (diff_df1 - residuals[row_idx]) / param_eps;
+                row_idx += 1;
+                jacobian[row_idx][k] = (diff_df2 - residuals[row_idx]) / param_eps;
+                row_idx += 1;
+            }
         }
 
         // Form normal equations J^T J delta = J^T r
@@ -974,17 +1000,20 @@ pub fn fit_orbit_doppler(
             for i in 0..n_params {
                 delta[i] /= scale_factors[i];
             }
-            let mut step_len = 0.0;
             for k in 0..n_params {
                 params[k] -= delta[k];
-                step_len += delta[k] * delta[k];
             }
 
             // Constrain physical parameters to valid ranges
             params[0] = params[0].max(6500e3).min(20000e3); // Altitude range
             params[1] = params[1].max(0.0).min(std::f64::consts::PI); // Inclination
 
-            if step_len.sqrt() < 1e-6 {
+            // Scale-aware convergence: check relative step size per parameter.
+            let max_rel_step = (0..n_params).map(|k| {
+                let denom = params[k].abs().max(1e-10);
+                delta[k].abs() / denom
+            }).fold(0.0f64, f64::max);
+            if max_rel_step < 1e-8 {
                 break; // Converged
             }
         } else {
@@ -1090,9 +1119,9 @@ pub fn format_tle_catalog(name: &str, orbit: &SolvedOrbit) -> String {
     let epoch_str = format!("{:02}{:03.8}", year_2d, day_of_year as f64 + day_fraction);
 
     // Format Keplerian elements
-    let i_deg = orbit.i.to_degrees() % 360.0;
-    let raan_deg = orbit.raan0.to_degrees() % 360.0;
-    let u0_deg = orbit.u0.to_degrees() % 360.0;
+    let i_deg = orbit.i.to_degrees().rem_euclid(360.0);
+    let raan_deg = orbit.raan0.to_degrees().rem_euclid(360.0);
+    let u0_deg = orbit.u0.to_degrees().rem_euclid(360.0);
 
     // Mean motion: n = sqrt(MU/a^3) rad/s. Format to revs per day
     let n_rad_s = (MU / orbit.a.powi(3)).sqrt();

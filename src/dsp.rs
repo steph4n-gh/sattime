@@ -881,23 +881,17 @@ impl DemodChannel {
         self.normalized_iq.copy_from_slice(raw_iq);
 
         // b. Perform Subspace Projection for LO Leakage Cancellation by subtracting the block mean.
-        let n = self.normalized_iq.len() as f32;
-        let mut sum = Complex::new(0.0, 0.0);
+        let n = self.normalized_iq.len() as f64;
+        let mut sum = Complex::<f64>::new(0.0, 0.0);
         for &s in &self.normalized_iq {
-            sum += s;
+            sum += Complex::new(s.re as f64, s.im as f64);
         }
-        let mean = sum / n;
+        let mean = Complex::new((sum.re / n) as f32, (sum.im / n) as f32);
         for s in &mut self.normalized_iq {
             *s -= mean;
         }
 
-        // c. Perform Bussgang Normalization (Constant Modulus Projection).
-        for s in &mut self.normalized_iq {
-            let norm = s.norm();
-            *s = *s / (norm + 1e-9_f32);
-        }
-
-        // d. Invoke self.ddc.process.
+        // c. Invoke self.ddc.process.
         self.ddc
             .process(&self.normalized_iq, f_shift, self.sample_rate, &mut self.mixed_samples);
 
@@ -931,6 +925,7 @@ impl DemodChannel {
             -20.0
         };
 
+
         let decimated_ts = self.decimator.decimation_factor as f64 / self.sample_rate;
 
         if has_signal {
@@ -948,6 +943,10 @@ impl DemodChannel {
 
                 let init_freq_offset = if !buffer_slice.is_empty() {
                     if self.pll_tracker.modulation == Modulation::Bpsk {
+                        // BPSK squaring doubles the carrier frequency. The ESPRIT estimate will be
+                        // at 2× the true carrier, which matches the EKF's internal tracking domain
+                        // (the EKF also squares samples in update()). Halving happens at readout
+                        // via the `scale` divisor — see dsp.rs line ~1073 and ekf.rs line ~357.
                         let squared_slice: Vec<Complex<f32>> = buffer_slice.iter().map(|&s| s * s).collect();
                         estimate_frequency_esprit(&squared_slice, esprit_rate, 10)
                     } else {
@@ -966,6 +965,19 @@ impl DemodChannel {
                             t.reset(0.0, init_freq_offset, 0.0);
                         }
                     }
+                }
+            }
+
+            // d. Perform Bussgang Normalization (Constant Modulus Projection) on narrowband decimated signal.
+            // NOTE: This must happen AFTER SNR estimation (which needs amplitude variance)
+            // and AFTER ESPRIT bootstrap (which needs spectral amplitude structure),
+            // but BEFORE the EKF tracking loop (which benefits from constant-modulus input).
+            for s in &mut self.decimated_samples {
+                let norm = s.norm();
+                if norm > 1e-6 {
+                    *s = *s / norm;
+                } else {
+                    *s = Complex::new(0.0, 0.0);
                 }
             }
 
@@ -1297,7 +1309,8 @@ pub fn estimate_frequency_esprit(samples: &[Complex<f32>], sample_rate: f64, m: 
     if denominator > 1e-12 {
         let psi = numerator / denominator;
         let angle = psi.im.atan2(psi.re);
-        -(angle * sample_rate) / (2.0 * std::f64::consts::PI)
+        let freq = -(angle * sample_rate) / (2.0 * std::f64::consts::PI);
+        freq.clamp(-sample_rate / 2.0, sample_rate / 2.0)
     } else {
         0.0
     }

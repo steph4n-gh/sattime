@@ -2,13 +2,9 @@ use crate::daemon::*;
 use crate::dsp::*;
 use crate::orbit::*;
 use crate::tui::*;
-use chrono::{DateTime, Datelike, Timelike, Utc};
-use nalgebra::{Matrix1, Matrix2, RowVector2, Vector2};
+use nalgebra::{Matrix1, Matrix2, Vector2};
 use num_complex::Complex;
-use rustfft::FftPlanner;
-use sgp4::Elements;
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
 
 pub struct ClockEkf {
     pub x: Vector2<f64>, // [phase_offset_seconds, freq_drift_ppm]
@@ -49,7 +45,8 @@ impl ClockEkf {
         let y = z - self.x;
         let r = Matrix2::new(self.r_meas, 0.0, 0.0, self.r_freq);
         let s = self.p + r;
-        let s_inv = s.try_inverse().unwrap_or_else(|| Matrix2::identity());
+        // If S is singular, skip the update entirely to prevent state jumps.
+        let Some(s_inv) = s.try_inverse() else { return; };
         let k = self.p * s_inv;
         self.x += k * y;
         let i = Matrix2::identity();
@@ -170,6 +167,10 @@ impl CarrierPllEkf {
     }
 
     pub fn update(&mut self, sample: Complex<f32>) {
+        // BPSK squaring: s² removes ±1 data modulation but doubles the carrier
+        // frequency. The EKF therefore tracks at 2× the true carrier frequency.
+        // All readout points divide by `scale = 2.0` to recover the true frequency.
+        // See dsp.rs process_block_with_center() and EkfTrackingBank::compute_tracker_frequency_diffs().
         let sample_to_use = match self.modulation {
             Modulation::Bpsk => sample * sample,
             _ => sample,
@@ -270,6 +271,31 @@ impl CarrierPllEkf {
             Modulation::Qpsk => (std::f64::consts::PI / 2.0, std::f64::consts::PI / 4.0),
         };
         self.x[0] = (self.x[0] + half_limit).rem_euclid(limit) - half_limit;
+
+        // NaN guard: if any state element is NaN, reset the tracker to prevent
+        // permanent poisoning of the state vector.
+        if self.x.iter().any(|v| v.is_nan()) {
+            self.x = Vector3::zeros();
+            self.p = Matrix3::new(
+                1.0, 0.0, 0.0,
+                0.0, 1e6, 0.0,
+                0.0, 0.0, 1e4,
+            );
+            self.is_locked = false;
+            self.lock_metric = 0.0;
+            return;
+        }
+
+        // Frequency and chirp magnitude bounds to prevent divergence.
+        let max_freq = 2.0 * std::f64::consts::PI * 50000.0; // 50 kHz max
+        let max_chirp = 2.0 * std::f64::consts::PI * 1000.0;  // 1 kHz/s max
+        self.x[1] = self.x[1].clamp(-max_freq, max_freq);
+        self.x[2] = self.x[2].clamp(-max_chirp, max_chirp);
+
+        // Minimum covariance floor to prevent overconfidence.
+        for i in 0..3 {
+            self.p[(i, i)] = self.p[(i, i)].max(1e-15);
+        }
 
         let i = Matrix3::identity();
         let a = i - k * h;

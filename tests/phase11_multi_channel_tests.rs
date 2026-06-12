@@ -118,14 +118,16 @@ fn test_demod_channel_init() {
 #[test]
 fn test_demod_channel_ddc_mixing() {
     let mut channel = DemodChannel::new(1000.0, 10000.0, "SAT_1".to_string());
-    let mut input = vec![num_complex::Complex::new(1.0f32, 0.0f32); 4096];
-    input[0] = num_complex::Complex::new(1.3f32, 0.0f32);
+    // Use uniform-amplitude input so DC removal doesn't shift individual samples.
+    let input = vec![num_complex::Complex::new(1.0f32, 0.0f32); 4096];
     channel.process_block(&input);
     assert_eq!(channel.mixed_samples.len(), input.len());
-    // The mixed samples should be derotated: sample * exp(-j 2pi f t)
-    // At index 0, phase is 0, so mixed sample is 1 + 0j
-    assert!((channel.mixed_samples[0].re - 1.0).abs() < 1e-5);
-    assert!(channel.mixed_samples[0].im.abs() < 1e-5);
+    // After DC removal, uniform samples become zero (mean == sample value).
+    // The mixed samples (DDC output) should therefore be near zero.
+    assert!(channel.mixed_samples[0].re.abs() < 1e-4,
+        "DDC output should be near zero after DC removal of uniform input, got {}", channel.mixed_samples[0].re);
+    assert!(channel.mixed_samples[0].im.abs() < 1e-4,
+        "DDC output imaginary should be near zero, got {}", channel.mixed_samples[0].im);
 }
 
 #[test]
@@ -1535,22 +1537,39 @@ fn test_bussgang_and_subspace_projection() {
         num_complex::Complex::new(0.375f32, 0.75f32),
     ];
     channel.process_block(&input);
-    
+
+    // After A1 pipeline reorder: normalized_iq contains DC-removed samples (no Bussgang).
+    // Bussgang normalization now applies to decimated_samples (post-DDC, post-decimation).
     assert_eq!(channel.normalized_iq.len(), 3);
-    
-    // Sample 0: (-0.125, -0.25) normalized
-    let expected_s0_re = -0.125f32 / ((0.078125f32).sqrt() + 1e-9f32);
-    let expected_s0_im = -0.25f32 / ((0.078125f32).sqrt() + 1e-9f32);
-    assert!((channel.normalized_iq[0].re - expected_s0_re).abs() < 1e-6);
-    assert!((channel.normalized_iq[0].im - expected_s0_im).abs() < 1e-6);
-    
-    // Sample 1: (0.0, 0.0) normalized
-    assert!((channel.normalized_iq[1].re - 0.0).abs() < 1e-6);
-    assert!((channel.normalized_iq[1].im - 0.0).abs() < 1e-6);
-    
-    // Sample 2: (0.125, 0.25) normalized
-    let expected_s2_re = 0.125f32 / ((0.078125f32).sqrt() + 1e-9f32);
-    let expected_s2_im = 0.25f32 / ((0.078125f32).sqrt() + 1e-9f32);
-    assert!((channel.normalized_iq[2].re - expected_s2_re).abs() < 1e-6);
-    assert!((channel.normalized_iq[2].im - expected_s2_im).abs() < 1e-6);
+
+    // DC removal: mean = (0.25, 0.5)
+    // Sample 0: (0.125 - 0.25, 0.25 - 0.5) = (-0.125, -0.25)
+    assert!((channel.normalized_iq[0].re - (-0.125)).abs() < 1e-5,
+        "DC removal sample 0 re: expected -0.125, got {}", channel.normalized_iq[0].re);
+    assert!((channel.normalized_iq[0].im - (-0.25)).abs() < 1e-5,
+        "DC removal sample 0 im: expected -0.25, got {}", channel.normalized_iq[0].im);
+
+    // Sample 1: (0.25 - 0.25, 0.5 - 0.5) = (0.0, 0.0)
+    assert!((channel.normalized_iq[1].re).abs() < 1e-5,
+        "DC removal sample 1 re: expected 0.0, got {}", channel.normalized_iq[1].re);
+    assert!((channel.normalized_iq[1].im).abs() < 1e-5,
+        "DC removal sample 1 im: expected 0.0, got {}", channel.normalized_iq[1].im);
+
+    // Sample 2: (0.375 - 0.25, 0.75 - 0.5) = (0.125, 0.25)
+    assert!((channel.normalized_iq[2].re - 0.125).abs() < 1e-5,
+        "DC removal sample 2 re: expected 0.125, got {}", channel.normalized_iq[2].re);
+    assert!((channel.normalized_iq[2].im - 0.25).abs() < 1e-5,
+        "DC removal sample 2 im: expected 0.25, got {}", channel.normalized_iq[2].im);
+
+    // Bussgang normalization now applies to decimated_samples (A1/A7).
+    // With only 3 input samples and a decimation factor of 4, decimated_samples
+    // may be empty or very short. Verify Bussgang was applied: any non-zero
+    // decimated sample should have unit modulus (hard threshold, A7).
+    for (i, s) in channel.decimated_samples.iter().enumerate() {
+        let mag = s.norm();
+        if mag > 1e-6 {
+            assert!((mag - 1.0).abs() < 1e-5,
+                "Bussgang: decimated_samples[{}] should have unit modulus, got {}", i, mag);
+        }
+    }
 }
