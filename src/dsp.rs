@@ -1653,6 +1653,10 @@ impl DemodChannel {
 
             // Execute single or multi-hypothesis tracking updates
             if let Some(ref mut bank) = self.tracking_bank {
+                // Dynamically update max_fade_steps to match the actual block/step size processed
+                if !raw_iq.is_empty() {
+                    bank.max_fade_steps = (self.fade_timeout * self.sample_rate / raw_iq.len() as f64) as usize;
+                }
                 let mut symbols = Vec::with_capacity(4); // Pre-allocate outside hot loop
                 for (s_idx, &s) in self.decimated_samples.iter().enumerate() {
                     for i in 0..3 {
