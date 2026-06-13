@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sattime Cyber-Physical HUD</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #080710;
+            --glass-bg: rgba(255, 255, 255, 0.03);
+            --glass-border: rgba(255, 255, 255, 0.08);
+            --text-primary: #ffffff;
+            --text-secondary: #8e8e93;
+            --accent-blue: #007aff;
+            --accent-cyan: #00c7fc;
+            --accent-green: #34c759;
+            --accent-purple: #af52de;
+            --accent-orange: #ff9500;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Outfit', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            overflow-x: hidden;
+            background-image: 
+                radial-gradient(circle at 10% 20%, rgba(0, 122, 255, 0.15) 0%, transparent 40%),
+                radial-gradient(circle at 90% 80%, rgba(175, 82, 222, 0.15) 0%, transparent 40%);
+            background-attachment: fixed;
+            min-height: 100vh;
+            padding: 24px;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px 24px;
+            background: var(--glass-bg);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid var(--glass-border);
+            border-radius: 16px;
+            margin-bottom: 24px;
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+        }
+
+        h1 {
+            font-size: 24px;
+            font-weight: 800;
+            letter-spacing: -0.5px;
+            background: linear-gradient(135deg, #fff 0%, var(--accent-cyan) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: 600;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: var(--accent-orange);
+            box-shadow: 0 0 12px var(--accent-orange);
+        }
+
+        .status-dot.connected {
+            background-color: var(--accent-green);
+            box-shadow: 0 0 12px var(--accent-green);
+        }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: 1.2fr 2fr;
+            gap: 24px;
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+
+        .card {
+            background: var(--glass-bg);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid var(--glass-border);
+            border-radius: 24px;
+            padding: 24px;
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .card-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--accent-cyan);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            padding-bottom: 12px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .canvas-container {
+            position: relative;
+            width: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        canvas {
+            border-radius: 12px;
+            max-width: 100%;
+        }
+
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 16px;
+        }
+
+        .metric-tile {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid rgba(255, 255, 255, 0.04);
+            border-radius: 16px;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .metric-label {
+            font-size: 12px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .metric-value {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .channels-table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+        }
+
+        .channels-table th {
+            font-size: 12px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            padding: 12px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .channels-table td {
+            padding: 12px;
+            font-size: 14px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 8px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .badge-locked { background: rgba(52, 199, 89, 0.15); color: var(--accent-green); }
+        .badge-acq { background: rgba(0, 122, 255, 0.15); color: var(--accent-blue); }
+        .badge-fade { background: rgba(255, 149, 0, 0.15); color: var(--accent-orange); }
+        .badge-idle { background: rgba(255, 255, 255, 0.1); color: var(--text-secondary); }
+
+        .right-column {
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+
+        @media (max-width: 1024px) {
+            .dashboard-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1>SATTIME OMNI-SENSOR HUD</h1>
+        <div class="status-badge">
+            <div id="status-dot" class="status-dot"></div>
+            <span id="status-text">DISCONNECTED</span>
+        </div>
+    </header>
+
+    <div class="dashboard-grid">
+        <!-- Left Column: Skyplot and Metrics -->
+        <div class="card">
+            <div class="card-title">Polar Satellite Skyplot</div>
+            <div class="canvas-container">
+                <canvas id="skyplot" width="380" height="380"></canvas>
+            </div>
+            <div class="metrics-grid">
+                <div class="metric-tile">
+                    <div class="metric-label">Receiver X/Y/Z</div>
+                    <div id="rx-pos" class="metric-value">0, 0, 0</div>
+                </div>
+                <div class="metric-tile">
+                    <div class="metric-label">Receiver Vx/Vy/Vz</div>
+                    <div id="rx-vel" class="metric-value">0, 0, 0</div>
+                </div>
+                <div class="metric-tile">
+                    <div class="metric-label">Clock Bias</div>
+                    <div id="clock-bias" class="metric-value">0.000000 s</div>
+                </div>
+                <div class="metric-tile">
+                    <div class="metric-label">Clock Drift</div>
+                    <div id="clock-drift" class="metric-value">0.000 ppm</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Right Column: S-Curves, Scintillation and Channel Status -->
+        <div class="right-column">
+            <div class="card">
+                <div class="card-title">Real-Time EKF residuals (S-Curves)</div>
+                <div class="canvas-container">
+                    <canvas id="scurves" width="700" height="220"></canvas>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">Active Tracking Channels</div>
+                <div style="overflow-x: auto;">
+                    <table class="channels-table">
+                        <thead>
+                            <tr>
+                                <th>Ch</th>
+                                <th>Satellite</th>
+                                <th>Status</th>
+                                <th>F_Expected</th>
+                                <th>Offset</th>
+                                <th>SNR</th>
+                                <th>TEC</th>
+                                <th>S4</th>
+                                <th>σ_φ</th>
+                            </tr>
+                        </thead>
+                        <tbody id="channels-list">
+                            <tr>
+                                <td colspan="9" style="text-align: center; color: var(--text-secondary);">No active channels. Waiting for telemetry data...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const skyCanvas = document.getElementById('skyplot');
+        const skyCtx = skyCanvas.getContext('2d');
+        const scCanvas = document.getElementById('scurves');
+        const scCtx = scCanvas.getContext('2d');
+
+        const statusDot = document.getElementById('status-dot');
+        const statusText = document.getElementById('status-text');
+
+        let channelsData = [];
+        let scurveHistory = {}; // ch_id -> array of residual offsets
+
+        function drawSkyplot() {
+            const width = skyCanvas.width;
+            const height = skyCanvas.height;
+            const cx = width / 2;
+            const cy = height / 2;
+            const radius = (width / 2) - 20;
+
+            skyCtx.clearRect(0, 0, width, height);
+
+            // Draw concentric rings
+            skyCtx.strokeStyle = 'rgba(0, 199, 252, 0.15)';
+            skyCtx.lineWidth = 1;
+            for (let r = 0.3; r <= 1.0; r += 0.3) {
+                skyCtx.beginPath();
+                skyCtx.arc(cx, cy, radius * r, 0, 2 * Math.PI);
+                skyCtx.stroke();
+            }
+
+            // Draw crosshairs
+            skyCtx.beginPath();
+            skyCtx.moveTo(cx - radius, cy);
+            skyCtx.lineTo(cx + radius, cy);
+            skyCtx.moveTo(cx, cy - radius);
+            skyCtx.lineTo(cx, cy + radius);
+            skyCtx.stroke();
+
+            // Draw direction labels
+            skyCtx.fillStyle = 'var(--text-secondary)';
+            skyCtx.font = '10px Outfit';
+            skyCtx.textAlign = 'center';
+            skyCtx.fillText('N', cx, cy - radius - 5);
+            skyCtx.fillText('S', cx, cy + radius + 12);
+            skyCtx.fillText('E', cx + radius + 10, cy + 3);
+            skyCtx.fillText('W', cx - radius - 10, cy + 3);
+
+            // Draw active satellites
+            channelsData.forEach(ch => {
+                if (ch.status === 'Idle') return;
+
+                // Convert ECEF positions to local ENU coordinates to compute correct local elevation and azimuth
+                const rxX = parseFloat(document.getElementById('rx-pos').dataset.x || 0);
+                const rxY = parseFloat(document.getElementById('rx-pos').dataset.y || 0);
+                const rxZ = parseFloat(document.getElementById('rx-pos').dataset.z || 6378137);
+
+                const dx = ch.sat_position[0] - rxX;
+                const dy = ch.sat_position[1] - rxY;
+                const dz = ch.sat_position[2] - rxZ;
+                const range = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                if (range < 1.0) return;
+
+                // Calculate receiver latitude and longitude
+                const a = 6378137.0;
+                const f = 1.0 / 298.257223563;
+                const b = a * (1.0 - f);
+                const e2 = (a * a - b * b) / (a * a);
+                const ep2 = (a * a - b * b) / (b * b);
+
+                const p = Math.sqrt(rxX * rxX + rxY * rxY);
+                let lat = 0.0;
+                let lon = 0.0;
+                if (p > 1.0) {
+                    const theta = Math.atan2(rxZ * a, p * b);
+                    lat = Math.atan2(rxZ + ep2 * b * Math.pow(Math.sin(theta), 3), p - e2 * a * Math.pow(Math.cos(theta), 3));
+                    lon = Math.atan2(rxY, rxX);
+                }
+
+                // Transform ECEF line-of-sight vector to local ENU
+                const cosLat = Math.cos(lat);
+                const sinLat = Math.sin(lat);
+                const cosLon = Math.cos(lon);
+                const sinLon = Math.sin(lon);
+
+                const east  = -sinLon * dx + cosLon * dy;
+                const north = -sinLat * cosLon * dx - sinLat * sinLon * dy + cosLat * dz;
+                const up    =  cosLat * cosLon * dx + cosLat * sinLon * dy + sinLat * dz;
+
+                const horizontalRange = Math.sqrt(east * east + north * north);
+                const el = Math.atan2(up, horizontalRange); // elevation angle
+                const az = Math.atan2(east, north);          // azimuth (clockwise from North)
+
+                // Only draw visible satellites
+                if (el < 0.0) return;
+
+                // Distance from center is proportional to zenith angle (pi/2 - el)
+                const r = radius * (1.0 - (el / (Math.PI / 2)));
+                const sx = cx + r * Math.sin(az);
+                const sy = cy - r * Math.cos(az);
+
+                // Color based on status
+                let color = 'var(--accent-blue)';
+                if (ch.status === 'Locked') color = 'var(--accent-green)';
+                else if (ch.status === 'Fade') color = 'var(--accent-orange)';
+
+                // Draw point
+                skyCtx.fillStyle = color;
+                skyCtx.beginPath();
+                skyCtx.arc(sx, sy, 8, 0, 2 * Math.PI);
+                skyCtx.fill();
+                skyCtx.strokeStyle = '#fff';
+                skyCtx.lineWidth = 2;
+                skyCtx.stroke();
+
+                // Draw label
+                skyCtx.fillStyle = 'var(--text-primary)';
+                skyCtx.font = 'bold 10px Outfit';
+                skyCtx.textAlign = 'center';
+                skyCtx.fillText(ch.sat_name, sx, sy - 12);
+            });
+        }
+
+        function drawSCurves() {
+            const width = scCanvas.width;
+            const height = scCanvas.height;
+            scCtx.clearRect(0, 0, width, height);
+
+            // Draw gridlines
+            scCtx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+            scCtx.lineWidth = 1;
+            scCtx.beginPath();
+            scCtx.moveTo(0, height / 2);
+            scCtx.lineTo(width, height / 2);
+            scCtx.stroke();
+
+            // Plot channel innovation histories
+            const colors = ['var(--accent-cyan)', 'var(--accent-green)', 'var(--accent-purple)', 'var(--accent-orange)'];
+            let i = 0;
+
+            for (const chId in scurveHistory) {
+                const history = scurveHistory[chId];
+                if (history.length < 2) continue;
+
+                scCtx.strokeStyle = colors[i % colors.length];
+                scCtx.lineWidth = 2;
+                scCtx.beginPath();
+
+                for (let idx = 0; idx < history.length; idx++) {
+                    const x = (idx / (history.length - 1)) * width;
+                    // Clamp values to prevent vertical lines drawing off-screen during search/transients
+                    const val = Math.max(-25.0, Math.min(25.0, history[idx]));
+                    const y = (height / 2) - (val * 4.0); // 4px per Hz offset (max 100px deviation)
+                    if (idx === 0) {
+                        scCtx.moveTo(x, y);
+                    } else {
+                        scCtx.lineTo(x, y);
+                    }
+                }
+                scCtx.stroke();
+                i++;
+            }
+        }
+
+        function updateTelemetry(data) {
+            // Update status
+            statusDot.className = 'status-dot connected';
+            statusText.textContent = 'CONNECTED';
+
+            // Update metrics
+            const pos = data.rx_position;
+            const vel = data.rx_velocity;
+            const posVal = document.getElementById('rx-pos');
+            posVal.textContent = `${pos[0].toFixed(1)}, ${pos[1].toFixed(1)}, ${pos[2].toFixed(1)}`;
+            posVal.dataset.x = pos[0];
+            posVal.dataset.y = pos[1];
+            posVal.dataset.z = pos[2];
+
+            document.getElementById('rx-vel').textContent = `${vel[0].toFixed(2)}, ${vel[1].toFixed(2)}, ${vel[2].toFixed(2)}`;
+            document.getElementById('clock-bias').textContent = `${(data.clock_bias).toFixed(6)} s`;
+            document.getElementById('clock-drift').textContent = `${(data.clock_drift * 1e6).toFixed(3)} ppm`;
+
+            channelsData = data.active_channels;
+
+            // Update S-curve history
+            channelsData.forEach(ch => {
+                if (ch.status === 'Idle') return;
+                if (!scurveHistory[ch.id]) {
+                    scurveHistory[ch.id] = [];
+                }
+                scurveHistory[ch.id].push(ch.freq_offset);
+                if (scurveHistory[ch.id].length > 200) {
+                    scurveHistory[ch.id].shift();
+                }
+            });
+
+            // Re-render table
+            const tbody = document.getElementById('channels-list');
+            tbody.innerHTML = '';
+            
+            const activeChs = channelsData.filter(ch => ch.status !== 'Idle');
+            if (activeChs.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="9" style="text-align: center; color: var(--text-secondary);">No active channels. Waiting for telemetry data...</td></tr>`;
+            } else {
+                activeChs.forEach(ch => {
+                    let badgeClass = 'badge-idle';
+                    if (ch.status === 'Locked') badgeClass = 'badge-locked';
+                    else if (ch.status === 'Acquisition') badgeClass = 'badge-acq';
+                    else if (ch.status === 'Fade') badgeClass = 'badge-fade';
+
+                    const row = document.createElement('tr');
+                    row.innerHTML = `
+                        <td>${ch.id}</td>
+                        <td style="color: #fff; font-weight: 600;">${ch.sat_name}</td>
+                        <td><span class="badge ${badgeClass}">${ch.status}</span></td>
+                        <td>${(ch.target_freq / 1e6).toFixed(3)} MHz</td>
+                        <td style="color: ${ch.freq_offset >= 0 ? 'var(--accent-cyan)' : 'var(--accent-orange)'}">
+                            ${ch.freq_offset >= 0 ? '+' : ''}${ch.freq_offset.toFixed(1)} Hz
+                        </td>
+                        <td>${ch.snr.toFixed(1)} dB</td>
+                        <td>${ch.tec.toFixed(3)}</td>
+                        <td>${ch.s4.toFixed(2)}</td>
+                        <td>${ch.sigma_phi.toFixed(3)}</td>
+                    `;
+                    tbody.appendChild(row);
+                });
+            }
+
+            drawSkyplot();
+            drawSCurves();
+        }
+
+        function connectWebSocket() {
+            const ws = new WebSocket(`ws://${window.location.hostname || 'localhost'}:9002`);
+
+            ws.onopen = () => {
+                statusDot.className = 'status-dot connected';
+                statusText.textContent = 'CONNECTED';
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    updateTelemetry(data);
+                } catch (e) {
+                    console.error("Error parsing telemetry frame: ", e);
+                }
+            };
+
+            ws.onclose = () => {
+                statusDot.className = 'status-dot';
+                statusText.textContent = 'DISCONNECTED';
+                setTimeout(connectWebSocket, 2000);
+            };
+
+            ws.onerror = () => {
+                ws.close();
+            };
+        }
+
+        // Initialize connection
+        connectWebSocket();
+        drawSkyplot();
+        drawSCurves();
+    </script>
+</body>
+</html>

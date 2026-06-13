@@ -91,6 +91,11 @@ pub struct CarrierPllEkf {
     pub pr_sum_q_sq: f64,
     pub convergence_guard: usize, // Samples remaining before lock_metric can trigger unlock
     pub frequency_ratio: f64,
+    pub raw_amp: [f64; 2],
+    pub unwrapped_phase1: f64,
+    pub unwrapped_phase2: f64,
+    pub last_innovation: f64,
+    pub innovation_history: VecDeque<f64>,
 }
 
 impl CarrierPllEkf {
@@ -122,6 +127,11 @@ impl CarrierPllEkf {
             pr_sum_q_sq: 0.0,
             convergence_guard: 0,
             frequency_ratio: 1.0,
+            raw_amp: [0.0, 0.0],
+            unwrapped_phase1: 0.0,
+            unwrapped_phase2: 0.0,
+            last_innovation: 0.0,
+            innovation_history: VecDeque::new(),
         }
     }
 
@@ -156,11 +166,22 @@ impl CarrierPllEkf {
         self.pr_sum_q_sq = 0.0;
         // Grace period: suppress unlock checks for 2048 samples so EKF can converge
         self.convergence_guard = 2048;
+        self.raw_amp = [0.0, 0.0];
+        self.unwrapped_phase1 = initial_phase;
+        self.unwrapped_phase2 = initial_phase;
+        self.last_innovation = 0.0;
+        self.innovation_history.clear();
     }
 
     pub fn predict(&mut self) {
         let dt = self.ts;
         let dt2 = 0.5 * dt * dt;
+
+        // Accumulate unwrapped phase changes
+        let dp1 = self.x[1] * dt + 0.5 * self.x[2] * dt * dt;
+        let dp2 = self.x[4] * dt + 0.5 * self.x[5] * dt * dt;
+        self.unwrapped_phase1 += dp1;
+        self.unwrapped_phase2 += dp2;
 
         let mut f = Matrix6::identity();
         f[(0, 1)] = dt;
@@ -221,7 +242,11 @@ impl CarrierPllEkf {
         let derotated_re = sample_to_use.re as f64 * cos_theta - sample_to_use.im as f64 * sin_theta;
         let derotated_im = sample_to_use.re as f64 * sin_theta + sample_to_use.im as f64 * cos_theta;
 
-        let amp = (sample_to_use.re as f64).hypot(sample_to_use.im as f64);
+        let amp = if self.raw_amp[chan] > 0.0 {
+            self.raw_amp[chan]
+        } else {
+            (sample_to_use.re as f64).hypot(sample_to_use.im as f64)
+        };
 
         let alpha = 0.005;
         self.envelope_ema = (1.0 - alpha) * self.envelope_ema + alpha * amp;
@@ -293,6 +318,12 @@ impl CarrierPllEkf {
             if self.pr_sum_q_sq < 0.0 {
                 self.pr_sum_q_sq = 0.0;
             }
+            
+            self.last_innovation = z;
+            self.innovation_history.push_back(z);
+            if self.innovation_history.len() > 2048 {
+                self.innovation_history.pop_front();
+            }
         }
 
         let s_val = self.p[(idx, idx)] + r_effective;
@@ -303,6 +334,13 @@ impl CarrierPllEkf {
             }
             for r in 0..6 {
                 self.x[r] += k[r] * z;
+            }
+            // Accumulate unwrapped phase correction
+            let delta_phase = k[idx] * z;
+            if chan == 0 {
+                self.unwrapped_phase1 += delta_phase;
+            } else {
+                self.unwrapped_phase2 += delta_phase;
             }
             self.x[idx] = (self.x[idx] + half_limit).rem_euclid(limit) - half_limit;
 
@@ -359,8 +397,10 @@ impl CarrierPllEkf {
 
     pub fn update(&mut self, sample: Complex<f32>) {
         let Some((norm_re, pr)) = self.update_channel(0, sample) else {
+            self.raw_amp = [0.0, 0.0];
             return;
         };
+        self.raw_amp = [0.0, 0.0];
 
         let beta = 0.001;
         self.lock_metric = (1.0 - beta) * self.lock_metric + beta * norm_re;
@@ -382,11 +422,14 @@ impl CarrierPllEkf {
 
     pub fn update_dual(&mut self, sample1: Complex<f32>, sample2: Complex<f32>) {
         let Some((norm_re, pr)) = self.update_channel(0, sample1) else {
+            self.raw_amp = [0.0, 0.0];
             return;
         };
         if self.update_channel(1, sample2).is_none() {
+            self.raw_amp = [0.0, 0.0];
             return;
         }
+        self.raw_amp = [0.0, 0.0];
 
         let beta = 0.001;
         self.lock_metric = (1.0 - beta) * self.lock_metric + beta * norm_re;

@@ -1,5 +1,5 @@
 use num_complex::Complex;
-use sattime::dsp::EcaCanceler;
+use sattime::dsp::{EcaCanceler, clean_ambiguity_map};
 
 #[test]
 fn test_eca_clutter_suppression() {
@@ -24,4 +24,36 @@ fn test_eca_clutter_suppression() {
             i, mag
         );
     }
+}
+
+#[test]
+fn test_clean_algorithm_omp() {
+    // Generate a simple 10x10 ambiguity map with a large target and a small target
+    let mut map = vec![vec![0.0f32; 10]; 10];
+    map[3][4] = 100.0; // Large airliner target
+    map[6][7] = 45.0;  // Small drone target
+
+    // Add some sidelobes from airliner using Gaussian spread
+    for r in 0..10 {
+        let dr = (r as f32 - 3.0).powi(2);
+        for c in 0..10 {
+            let dc = (c as f32 - 4.0).powi(2);
+            map[r][c] += 100.0 * (-dr/8.0 - dc/8.0).exp();
+        }
+    }
+    // Set exact peak values again
+    map[3][4] = 100.0;
+    map[6][7] = 45.0;
+
+    let components = clean_ambiguity_map(&mut map, 2, 0.8);
+    
+    assert_eq!(components.len(), 2);
+    // First component should be airliner at (3, 4)
+    assert_eq!(components[0].0, 3);
+    assert_eq!(components[0].1, 4);
+    assert!(components[0].2 > 90.0);
+
+    // Second component should be drone at (6, 7)
+    assert_eq!(components[1].0, 6);
+    assert_eq!(components[1].1, 7);
 }
