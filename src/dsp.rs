@@ -1266,6 +1266,7 @@ pub struct DemodChannel {
     pub current_tec: f64,
     pub raw_norms: Vec<f64>,
     pub raw_norms2: Vec<f64>,
+    pub amp_history: VecDeque<f64>,
     pub last_carrier_freq_offset: Option<f64>,
     pub smoothed_free_freq: Option<f64>,
 }
@@ -1382,6 +1383,7 @@ impl DemodChannel {
             current_tec: 0.0,
             raw_norms: Vec::new(),
             raw_norms2: Vec::new(),
+            amp_history: VecDeque::new(),
             last_carrier_freq_offset: None,
             smoothed_free_freq: None,
         }
@@ -1611,7 +1613,12 @@ impl DemodChannel {
             // d. Save raw norms for EKF adaptive fading before Bussgang Normalization
             self.raw_norms.resize(self.decimated_samples.len(), 0.0);
             for (i, s) in self.decimated_samples.iter().enumerate() {
-                self.raw_norms[i] = s.norm() as f64;
+                let norm = s.norm() as f64;
+                self.raw_norms[i] = norm;
+                self.amp_history.push_back(norm);
+                if self.amp_history.len() > 1024 {
+                    self.amp_history.pop_front();
+                }
             }
             if self.is_dual {
                 self.raw_norms2.resize(self.decimated_samples2.len(), 0.0);

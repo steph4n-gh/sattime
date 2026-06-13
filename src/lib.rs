@@ -4,6 +4,9 @@ pub mod ekf;
 pub mod orbit;
 pub mod orbit_solver;
 pub mod tui;
+pub mod nav_ekf;
+pub mod space_weather;
+pub mod glass_time;
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};

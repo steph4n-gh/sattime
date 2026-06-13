@@ -94,6 +94,8 @@ pub struct CarrierPllEkf {
     pub raw_amp: [f64; 2],
     pub unwrapped_phase1: f64,
     pub unwrapped_phase2: f64,
+    pub last_innovation: f64,
+    pub innovation_history: VecDeque<f64>,
 }
 
 impl CarrierPllEkf {
@@ -128,6 +130,8 @@ impl CarrierPllEkf {
             raw_amp: [0.0, 0.0],
             unwrapped_phase1: 0.0,
             unwrapped_phase2: 0.0,
+            last_innovation: 0.0,
+            innovation_history: VecDeque::new(),
         }
     }
 
@@ -165,6 +169,8 @@ impl CarrierPllEkf {
         self.raw_amp = [0.0, 0.0];
         self.unwrapped_phase1 = initial_phase;
         self.unwrapped_phase2 = initial_phase;
+        self.last_innovation = 0.0;
+        self.innovation_history.clear();
     }
 
     pub fn predict(&mut self) {
@@ -311,6 +317,12 @@ impl CarrierPllEkf {
             }
             if self.pr_sum_q_sq < 0.0 {
                 self.pr_sum_q_sq = 0.0;
+            }
+            
+            self.last_innovation = z;
+            self.innovation_history.push_back(z);
+            if self.innovation_history.len() > 2048 {
+                self.innovation_history.pop_front();
             }
         }
 

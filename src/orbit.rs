@@ -2333,3 +2333,141 @@ pub fn load_orbits(path: &str) -> io::Result<Vec<(String, OrbitModel)>> {
     }
     Ok(satellites)
 }
+
+/// Computes central gravity acceleration (Earth central gravitational potential)
+pub fn central_gravity_acceleration(pos: [f64; 3]) -> [f64; 3] {
+    const MU: f64 = 3.986004418e14; // m^3/s^2
+    let r2 = pos[0]*pos[0] + pos[1]*pos[1] + pos[2]*pos[2];
+    let r = r2.sqrt();
+    if r < 1e-3 {
+        return [0.0, 0.0, 0.0];
+    }
+    let factor = -MU / (r2 * r);
+    [pos[0] * factor, pos[1] * factor, pos[2] * factor]
+}
+
+/// 2nd-Order Leapfrog (Verlet) Symplectic Integrator
+pub struct LeapfrogIntegrator;
+
+impl LeapfrogIntegrator {
+    pub fn step(pos: [f64; 3], vel: [f64; 3], dt: f64) -> ([f64; 3], [f64; 3]) {
+        // Half-step position: r_half = r_n + 0.5 * dt * v_n
+        let r_half = [
+            pos[0] + 0.5 * dt * vel[0],
+            pos[1] + 0.5 * dt * vel[1],
+            pos[2] + 0.5 * dt * vel[2],
+        ];
+
+        // Acceleration at half-step
+        let a_half = central_gravity_acceleration(r_half);
+
+        // Full-step velocity: v_{n+1} = v_n + dt * a_half
+        let v_next = [
+            vel[0] + dt * a_half[0],
+            vel[1] + dt * a_half[1],
+            vel[2] + dt * a_half[2],
+        ];
+
+        // Full-step position: r_{n+1} = r_half + 0.5 * dt * v_{n+1}
+        let r_next = [
+            r_half[0] + 0.5 * dt * v_next[0],
+            r_half[1] + 0.5 * dt * v_next[1],
+            r_half[2] + 0.5 * dt * v_next[2],
+        ];
+
+        (r_next, v_next)
+    }
+
+    pub fn propagate(mut pos: [f64; 3], mut vel: [f64; 3], dt: f64, steps: usize) -> ([f64; 3], [f64; 3]) {
+        for _ in 0..steps {
+            let (next_pos, next_vel) = Self::step(pos, vel, dt);
+            pos = next_pos;
+            vel = next_vel;
+        }
+        (pos, vel)
+    }
+}
+
+/// 4th-Order Runge-Kutta-Nyström (RKN) / Forest-Ruth Symplectic Integrator
+pub struct RknSymplecticIntegrator;
+
+impl RknSymplecticIntegrator {
+    pub fn step(mut pos: [f64; 3], mut vel: [f64; 3], dt: f64) -> ([f64; 3], [f64; 3]) {
+        // Forest-Ruth coefficients
+        let theta = 1.3512071917951;
+        let c1 = theta / 2.0;
+        let c2 = (1.0 - theta) / 2.0;
+        let c3 = c2;
+        let c4 = c1;
+        let d1 = theta;
+        let d2 = 1.0 - 2.0 * theta;
+        let d3 = d1;
+        let d4 = 0.0;
+
+        let cs = [c1, c2, c3, c4];
+        let ds = [d1, d2, d3, d4];
+
+        for i in 0..4 {
+            // Stage update
+            pos[0] += cs[i] * dt * vel[0];
+            pos[1] += cs[i] * dt * vel[1];
+            pos[2] += cs[i] * dt * vel[2];
+
+            let a = central_gravity_acceleration(pos);
+
+            vel[0] += ds[i] * dt * a[0];
+            vel[1] += ds[i] * dt * a[1];
+            vel[2] += ds[i] * dt * a[2];
+        }
+
+        (pos, vel)
+    }
+
+    pub fn propagate(mut pos: [f64; 3], mut vel: [f64; 3], dt: f64, steps: usize) -> ([f64; 3], [f64; 3]) {
+        for _ in 0..steps {
+            let (next_pos, next_vel) = Self::step(pos, vel, dt);
+            pos = next_pos;
+            vel = next_vel;
+        }
+        (pos, vel)
+    }
+}
+
+#[cfg(test)]
+mod orbit_tests {
+    use super::*;
+
+    #[test]
+    fn test_symplectic_integrators_energy_conservation() {
+        let mu: f64 = 3.986004418e14;
+        let r = 7178137.0; // Circular orbit at 800 km altitude
+        let v_circ = (mu / r).sqrt();
+
+        let pos_init = [r, 0.0, 0.0];
+        let vel_init = [0.0, v_circ, 0.0];
+
+        let initial_energy = 0.5 * v_circ * v_circ - mu / r;
+
+        let dt = 1.0;
+        let steps = 100_000;
+
+        // 1. Leapfrog (2nd-order symplectic)
+        let (pos_lf, vel_lf) = LeapfrogIntegrator::propagate(pos_init, vel_init, dt, steps);
+        let lf_v2 = vel_lf[0]*vel_lf[0] + vel_lf[1]*vel_lf[1] + vel_lf[2]*vel_lf[2];
+        let lf_r = (pos_lf[0]*pos_lf[0] + pos_lf[1]*pos_lf[1] + pos_lf[2]*pos_lf[2]).sqrt();
+        let lf_energy = 0.5 * lf_v2 - mu / lf_r;
+        let lf_energy_err = (lf_energy - initial_energy).abs() / initial_energy.abs();
+        
+        assert!(lf_energy_err < 1e-4, "Leapfrog energy relative error too high: {}", lf_energy_err);
+
+        // 2. RKN (4th-order symplectic)
+        let (pos_rkn, vel_rkn) = RknSymplecticIntegrator::propagate(pos_init, vel_init, dt, steps);
+        let rkn_v2 = vel_rkn[0]*vel_rkn[0] + vel_rkn[1]*vel_rkn[1] + vel_rkn[2]*vel_rkn[2];
+        let rkn_r = (pos_rkn[0]*pos_rkn[0] + pos_rkn[1]*pos_rkn[1] + pos_rkn[2]*pos_rkn[2]).sqrt();
+        let rkn_energy = 0.5 * rkn_v2 - mu / rkn_r;
+        let rkn_energy_err = (rkn_energy - initial_energy).abs() / initial_energy.abs();
+
+        assert!(rkn_energy_err < 1e-6, "RKN energy relative error too high: {}", rkn_energy_err);
+    }
+}
+

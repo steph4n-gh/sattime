@@ -917,7 +917,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    let pos_obs = wgs84_to_ecef(args.lat, args.lon, args.alt);
+    let mut pos_obs = wgs84_to_ecef(args.lat, args.lon, args.alt);
 
     // If simulation mode, generate raw IQ bytes and output to stdout
     if args.simulate {
@@ -1979,6 +1979,8 @@ fn main() {
     let mut mixed_scratch = vec![Complex::new(0.0f32, 0.0f32); 32768];
     let mut main_eca_canceler = crate::dsp::EcaCanceler::new();
     let mut eca_cleaned_samples = Vec::new();
+    let mut master_nav_ekf = sattime::nav_ekf::MasterNavEkf::new(pos_obs);
+    let glass_time_server = sattime::glass_time::GlassTimeServer::start(9002);
 
     for samples in &rx {
         if !running.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2275,6 +2277,47 @@ fn main() {
             &samples
         };
 
+        // Steer channel target frequencies using EKF predicted state
+        let dt = (samples.len() as f64) / args.sample_rate;
+        master_nav_ekf.predict(dt);
+
+        for ch in &mut channels {
+            if ch.status != ChannelStatus::Idle {
+                if let Some(ref orbit) = ch.orbit {
+                    if let Some((pos_sat, vel_sat)) = orbit.propagate_ecef(current_step_time) {
+                        let rx_x = master_nav_ekf.x[0];
+                        let rx_y = master_nav_ekf.x[1];
+                        let rx_z = master_nav_ekf.x[2];
+                        let rx_vx = master_nav_ekf.x[3];
+                        let rx_vy = master_nav_ekf.x[4];
+                        let rx_vz = master_nav_ekf.x[5];
+                        let clk_drift = master_nav_ekf.x[7];
+
+                        let dx = pos_sat[0] - rx_x;
+                        let dy = pos_sat[1] - rx_y;
+                        let dz = pos_sat[2] - rx_z;
+                        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+                        if dist > 1.0 {
+                            let ux = dx / dist;
+                            let uy = dy / dist;
+                            let uz = dz / dist;
+
+                            let range_rate = ux * (rx_vx - vel_sat[0])
+                                + uy * (rx_vy - vel_sat[1])
+                                + uz * (rx_vz - vel_sat[2]);
+
+                            let doppler_mult = 1.0 - range_rate / sattime::nav_ekf::C;
+                            let f_c = if ch.initial_freq > 0.0 { ch.initial_freq } else { current_freq };
+                            ch.target_freq = f_c * (doppler_mult - clk_drift);
+                            if ch.is_dual && ch.frequency2 > 0.0 {
+                                ch.target_freq2 = ch.frequency2 * (doppler_mult - clk_drift);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         process_pipeline_parallel(&mut channels, samples_to_process, current_freq, args.sample_rate);
 
         for ch in &mut channels {
@@ -2358,6 +2401,113 @@ fn main() {
             _decimator = channels[0].decimator.clone();
             tracking_bank = channels[0].tracking_bank.clone();
         }
+
+        // Update Master EKF from active tracking channels
+        for ch in &mut channels {
+            if ch.status == ChannelStatus::Locked {
+                if let Some(ref orbit) = ch.orbit {
+                    if let Some((pos_sat, vel_sat)) = orbit.propagate_ecef(current_step_time) {
+                        // Check Čech Cohomology discrepancy as a topological firewall
+                        let mut discrepancy = 0.0;
+                        if let Some(ref bank) = ch.tracking_bank {
+                            discrepancy = bank.compute_tracker_discrepancy() as f64;
+                        }
+                        if discrepancy > 150.0 {
+                            // Spoofing or extreme multipath: skip updating the Master EKF to protect navigation state
+                            continue;
+                        }
+
+                        // Retrieve the active tracker (or primary PLL tracker)
+                        let active_tracker = if let Some(ref bank) = ch.tracking_bank {
+                            bank.active_idx
+                                .map(|idx| &bank.trackers[idx])
+                                .unwrap_or(&ch.pll_tracker)
+                        } else {
+                            &ch.pll_tracker
+                        };
+
+                        let scale = if active_tracker.modulation == Modulation::Bpsk { 2.0 } else { 1.0 };
+                        let phase_residual = active_tracker.last_innovation / scale;
+                        let ch_freq_offset = (active_tracker.x[1] / scale) / (2.0 * std::f64::consts::PI);
+
+                        let snr_linear = 10.0f64.powf((ch.snr as f64) / 10.0).max(0.1);
+                        let lock_metric = active_tracker.lock_metric.clamp(1e-3, 1.0);
+                        let noise_scale = 1.0 / (lock_metric * lock_metric * snr_linear);
+
+                        let f_c = if ch.initial_freq > 0.0 { ch.initial_freq } else { current_freq };
+                        master_nav_ekf.update_channel(
+                            pos_sat,
+                            vel_sat,
+                            phase_residual,
+                            ch_freq_offset,
+                            f_c,
+                            noise_scale,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Update observer position dynamically from Master EKF
+        pos_obs[0] = master_nav_ekf.x[0];
+        pos_obs[1] = master_nav_ekf.x[1];
+        pos_obs[2] = master_nav_ekf.x[2];
+
+        // Serialize and broadcast real-time telemetry to WebSocket clients
+        let mut active_channels = Vec::new();
+        for ch in &mut channels {
+            if ch.status != ChannelStatus::Idle {
+                let sat_pos = if let Some(ref orbit) = ch.orbit {
+                    if let Some((pos_sat, _)) = orbit.propagate_ecef(current_step_time) {
+                        pos_sat
+                    } else {
+                        [0.0, 0.0, 0.0]
+                    }
+                } else {
+                    [0.0, 0.0, 0.0]
+                };
+
+                ch.amp_history.make_contiguous();
+                let active_tracker = if let Some(ref mut bank) = ch.tracking_bank {
+                    bank.active_idx
+                        .map(|idx| &mut bank.trackers[idx])
+                        .unwrap_or(&mut ch.pll_tracker)
+                } else {
+                    &mut ch.pll_tracker
+                };
+                active_tracker.innovation_history.make_contiguous();
+
+                let s4 = sattime::space_weather::compute_s4(ch.amp_history.as_slices().0);
+                let sigma_phi = sattime::space_weather::compute_sigma_phi(active_tracker.innovation_history.as_slices().0);
+
+                let scale = if active_tracker.modulation == Modulation::Bpsk { 2.0 } else { 1.0 };
+                let ch_freq_offset = (active_tracker.x[1] / scale) / (2.0 * std::f64::consts::PI);
+
+                active_channels.push(sattime::glass_time::ChannelTelem {
+                    id: ch.id,
+                    sat_name: ch.sat_name.clone(),
+                    status: format!("{:?}", ch.status),
+                    target_freq: ch.target_freq,
+                    freq_offset: ch_freq_offset,
+                    snr: ch.snr,
+                    tec: ch.current_tec,
+                    s4,
+                    sigma_phi,
+                    is_dual: ch.is_dual,
+                    sat_position: sat_pos,
+                });
+            }
+        }
+
+        let frame = sattime::glass_time::TelemetryFrame {
+            timestamp: current_step_time.to_rfc3339(),
+            rx_position: [master_nav_ekf.x[0], master_nav_ekf.x[1], master_nav_ekf.x[2]],
+            rx_velocity: [master_nav_ekf.x[3], master_nav_ekf.x[4], master_nav_ekf.x[5]],
+            clock_bias: master_nav_ekf.x[6],
+            clock_drift: master_nav_ekf.x[7],
+            active_channels,
+        };
+        let _ = glass_time_server.telemetry_tx.send(frame);
 
         // Run RealTimeGeoSolver at 1 Hz if >= 4 channels are locked
         let locked_count = channels.iter().filter(|ch| ch.status == ChannelStatus::Locked).count();
