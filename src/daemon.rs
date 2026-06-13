@@ -15,6 +15,7 @@ pub struct LeodoLoop {
     pub pending_step_adjustment: Option<f64>,
     pub shm_unit: Option<usize>,
     pub active_slew: f64,
+    pub consensus_engine: ConsensusSteeringEngine,
 }
 
 impl LeodoLoop {
@@ -30,6 +31,7 @@ impl LeodoLoop {
             pending_step_adjustment: None,
             shm_unit: None,
             active_slew: 0.0,
+            consensus_engine: ConsensusSteeringEngine::new(),
         }
     }
 }

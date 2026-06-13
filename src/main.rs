@@ -516,6 +516,8 @@ fn check_and_save_pass_steering(
                 let output_dir = args.output_dir.clone();
                 let tle_path_clone = tle_path.to_string();
                 let solver_tx_clone = solver_tx.clone();
+                let sat_name = ch.sat_name.clone();
+                let snr = ch.snr;
 
                 std::thread::spawn(move || {
                     if let Some(ref orbit) = orbit_clone {
@@ -546,17 +548,60 @@ fn check_and_save_pass_steering(
                                         rmse
                                     );
 
+                                    // Compute max elevation for this pass
+                                    let mut max_el_rad = 0.0f64;
+                                    for &(dt_sample, _) in &downsampled_clone {
+                                        if let Some((pos_sat, _)) = orbit.propagate_ecef(dt_sample) {
+                                            let enu = ecef_to_enu(pos_sat, pos_obs);
+                                            let (_, el) = enu_to_az_el(enu);
+                                            if el > max_el_rad {
+                                                max_el_rad = el;
+                                            }
+                                        }
+                                    }
+                                    let max_elevation = max_el_rad.to_degrees();
+                                    let df_ppm = (df / initial_freq) * 1e6;
+
                                     let mut loop_lock = get_leodo_loop().lock().unwrap();
-                                    let steer_msgs = steer_system_clock(
-                                        dt,
-                                        df,
-                                        initial_freq,
-                                        &leodo_log,
-                                        leodo,
-                                        &mut loop_lock,
-                                    );
-                                    for msg in steer_msgs {
-                                        tracing::info!("{}", msg);
+
+                                    // Add the pass result to the consensus engine
+                                    let pass = CompletedPassData {
+                                        sat_name: sat_name.clone(),
+                                        timestamp: chrono::Utc::now(),
+                                        offset_seconds: dt,
+                                        freq_drift_ppm: df_ppm,
+                                        snr,
+                                        max_elevation,
+                                        fit_rmse: rmse,
+                                    };
+                                    loop_lock.consensus_engine.add_pass_result(pass);
+
+                                    // Retrieve the consensus update
+                                    if let Some((consensus_offset, consensus_drift_ppm)) =
+                                        loop_lock.consensus_engine.get_consensus_update()
+                                    {
+                                        tracing::info!(
+                                            "[LEODO] Consensus update computed: offset={:.6}s, drift={:.3} PPM (from {} passes)",
+                                            consensus_offset,
+                                            consensus_drift_ppm,
+                                            loop_lock.consensus_engine.passes.len()
+                                        );
+
+                                        let consensus_drift_hz = (consensus_drift_ppm / 1e6) * initial_freq;
+
+                                        let steer_msgs = steer_system_clock(
+                                            consensus_offset,
+                                            consensus_drift_hz,
+                                            initial_freq,
+                                            &leodo_log,
+                                            leodo,
+                                            &mut loop_lock,
+                                        );
+                                        for msg in steer_msgs {
+                                            tracing::info!("{}", msg);
+                                        }
+                                    } else {
+                                        tracing::warn!("[LEODO] Consensus engine returned no update yet (all passes filtered out).");
                                     }
                                 } else {
                                     tracing::info!(

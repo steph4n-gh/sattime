@@ -1573,3 +1573,35 @@ fn test_bussgang_and_subspace_projection() {
         }
     }
 }
+
+#[test]
+fn test_leodo_loop_with_consensus_steering() {
+    let mut leodo_loop = daemon::LeodoLoop::new();
+
+    leodo_loop.consensus_engine.add_pass_result(CompletedPassData {
+        sat_name: "SAT_TEST_1".to_string(),
+        timestamp: chrono::Utc::now(),
+        offset_seconds: 0.10,
+        freq_drift_ppm: 0.20,
+        snr: 10.0,
+        max_elevation: 45.0,
+        fit_rmse: 2.0,
+    });
+
+    leodo_loop.consensus_engine.add_pass_result(CompletedPassData {
+        sat_name: "SAT_TEST_2".to_string(),
+        timestamp: chrono::Utc::now(),
+        offset_seconds: 0.20,
+        freq_drift_ppm: 0.40,
+        snr: 10.0,
+        max_elevation: 45.0,
+        fit_rmse: 2.0,
+    });
+
+    let update = leodo_loop.consensus_engine.get_consensus_update();
+    assert!(update.is_some());
+    let (consensus_offset, consensus_drift_ppm) = update.unwrap();
+
+    assert!((consensus_offset - 0.15).abs() < 1e-5);
+    assert!((consensus_drift_ppm - 0.30).abs() < 1e-5);
+}
