@@ -1525,7 +1525,11 @@ fn main() {
                     .recv()
                     .unwrap_or_else(|_| vec![Complex::new(0.0f32, 0.0f32); 32768]);
                 if buf.len() < 32768 {
-                    buf.resize(32768, Complex::new(0.0f32, 0.0f32));
+                    if buf.capacity() >= 32768 {
+                        unsafe { buf.set_len(32768); }
+                    } else {
+                        buf.resize(32768, Complex::new(0.0f32, 0.0f32));
+                    }
                 }
 
                 let mut slice = &mut buf[..];
@@ -1646,6 +1650,7 @@ fn main() {
     let mut fft_scratch = vec![Complex::new(0.0f32, 0.0f32); fft.get_inplace_scratch_len()];
 
     let mut step_count = 0;
+    let mut last_geo_solve_time: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut start_system_time = if args.sim_start_time && !satellites.is_empty() {
         let (_sat_name, orbit) = &satellites[0];
         if let Some(pca_time) = find_pca_time(orbit, pos_obs, orbit.epoch()) {
@@ -2236,7 +2241,11 @@ fn main() {
             + chrono::Duration::microseconds((current_elapsed_seconds * 1e6) as i64);
 
         if mixed_scratch.len() != samples.len() {
-            mixed_scratch.resize(samples.len(), Complex::new(0.0f32, 0.0f32));
+            if mixed_scratch.capacity() >= samples.len() {
+                unsafe { mixed_scratch.set_len(samples.len()); }
+            } else {
+                mixed_scratch.resize(samples.len(), Complex::new(0.0f32, 0.0f32));
+            }
         }
 
         let mut primary_updated = false;
@@ -2252,7 +2261,11 @@ fn main() {
         raw_snr_db = 0.0f32;
 
         if eca_cleaned_samples.len() != samples.len() {
-            eca_cleaned_samples.resize(samples.len(), Complex::new(0.0f32, 0.0f32));
+            if eca_cleaned_samples.capacity() >= samples.len() {
+                unsafe { eca_cleaned_samples.set_len(samples.len()); }
+            } else {
+                eca_cleaned_samples.resize(samples.len(), Complex::new(0.0f32, 0.0f32));
+            }
         }
 
         let samples_to_process = if !args.no_eca {
@@ -2346,13 +2359,73 @@ fn main() {
             tracking_bank = channels[0].tracking_bank.clone();
         }
 
+        // Run RealTimeGeoSolver at 1 Hz if >= 4 channels are locked
+        let locked_count = channels.iter().filter(|ch| ch.status == ChannelStatus::Locked).count();
+        if locked_count >= 4 {
+            let now_utc = chrono::Utc::now();
+            let should_run = match last_geo_solve_time {
+                None => true,
+                Some(last) => (now_utc - last).num_seconds() >= 1,
+            };
+            if should_run {
+                last_geo_solve_time = Some(now_utc);
+                let mut measurements = Vec::new();
+                for ch in &channels {
+                    if ch.status == ChannelStatus::Locked {
+                        if let Some(ref orbit) = ch.orbit {
+                            if let Some((pos_sat, vel_sat)) = orbit.propagate_ecef(current_step_time) {
+                                let dx = pos_sat[0] - pos_obs[0];
+                                let dy = pos_sat[1] - pos_obs[1];
+                                let dz = pos_sat[2] - pos_obs[2];
+                                let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+                                
+                                // True range
+                                let range = dist;
+                                
+                                measurements.push((
+                                    ECEFCoordinates { x: pos_sat[0], y: pos_sat[1], z: pos_sat[2] },
+                                    Velocity { vx: vel_sat[0], vy: vel_sat[1], vz: vel_sat[2] },
+                                    range,
+                                ));
+                            }
+                        }
+                    }
+                }
+                if measurements.len() >= 4 {
+                    let mut solver = RealTimeGeoSolver::new();
+                    solver.apply_troposphere = true;
+                    if let Some(solved_coords) = solver.update_position(&measurements) {
+                        // Print solved coordinates to logs
+                        tracing::info!(
+                            "[GEODESOLVER] Solved user position: Lat = {:.6}°, Lon = {:.6}°, Alt = {:.1}m",
+                            solved_coords.latitude,
+                            solved_coords.longitude,
+                            solved_coords.altitude
+                        );
+                        // Store the result in the global static GEOLOCATION_RESULT
+                        let mut geo_res = get_geolocation_result().lock().unwrap();
+                        geo_res.lat = solved_coords.latitude;
+                        geo_res.lon = solved_coords.longitude;
+                        geo_res.alt = solved_coords.altitude;
+                        geo_res.converged = true;
+                    } else {
+                        tracing::warn!("[GEODESOLVER] Solver failed to converge.");
+                    }
+                }
+            }
+        }
+
         // Now run the raw input decimation for spectrum visualization and main TUI draw
         decimated_samples.clear();
         raw_decimator.process(&samples, &mut decimated_samples);
 
         let mut recycled_buf = samples;
-        recycled_buf.clear();
-        recycled_buf.resize(32768, Complex::new(0.0f32, 0.0f32));
+        if recycled_buf.capacity() >= 32768 {
+            unsafe { recycled_buf.set_len(32768); }
+        } else {
+            recycled_buf.clear();
+            recycled_buf.resize(32768, Complex::new(0.0f32, 0.0f32));
+        }
         let _ = pool_tx.send(recycled_buf);
 
         if decimated_samples.is_empty() {
@@ -2388,6 +2461,8 @@ fn main() {
                         (1.0 - alpha) * fft_mag_ema[k] + alpha * fft_input[k].norm_sqr();
                 }
             }
+
+            EnvelopeWaveletSpurCanceller::notch_spurs_wavelet(&mut fft_mag_ema, 0.0, 0.0);
 
             if step_count > 0 && step_count % 1000 == 0 {
                 let mut sorted = Vec::with_capacity(search_indices.len());

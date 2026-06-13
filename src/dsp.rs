@@ -3,6 +3,18 @@ use chrono::{DateTime, Utc};
 use num_complex::Complex;
 use rustfft::FftPlanner;
 use std::collections::VecDeque;
+use std::sync::LazyLock;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+static HAS_AVX2_FMA: LazyLock<bool> = LazyLock::new(|| {
+    std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
+});
+
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+static HAS_NEON: LazyLock<bool> = LazyLock::new(|| {
+    std::arch::is_aarch64_feature_detected!("neon")
+});
+
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Modulation {
     #[default]
@@ -331,13 +343,9 @@ impl FirDecimator {
         Complex::new(re, im)
     }
 
-    pub fn process(&mut self, input: &[Complex<f32>], output: &mut Vec<Complex<f32>>) {
-        if self.decimation_factor <= 1 {
-            output.reserve(input.len());
-            output.extend_from_slice(input);
-            return;
-        }
-
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn process_avx2(&mut self, input: &[Complex<f32>], output: &mut Vec<Complex<f32>>) {
         let num_taps = self.taps.len();
         let hist_len = self.history.len();
         let total_len = hist_len + input.len();
@@ -346,7 +354,6 @@ impl FirDecimator {
         output.reserve(projected_capacity);
 
         let mut idx = self.pending_offset;
-        // Boundary Phase: process samples that overlap with history
         while idx < hist_len && idx + num_taps <= total_len {
             let mut sum = Complex::new(0.0f32, 0.0f32);
             for n in 0..num_taps {
@@ -362,11 +369,10 @@ impl FirDecimator {
             idx += self.decimation_factor;
         }
 
-        // Main Phase: contiguous slice processing (using SIMD)
         while idx + num_taps <= total_len {
             let input_offset = idx - hist_len;
             let input_slice = &input[input_offset..input_offset + num_taps];
-            output.push(self.compute(input_slice));
+            output.push(unsafe { self.compute_x86_64(input_slice) });
             idx += self.decimation_factor;
         }
 
@@ -380,6 +386,116 @@ impl FirDecimator {
             self.history.copy_within(input.len().., 0);
             self.history[shift..].copy_from_slice(input);
         }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn process_neon(&mut self, input: &[Complex<f32>], output: &mut Vec<Complex<f32>>) {
+        let num_taps = self.taps.len();
+        let hist_len = self.history.len();
+        let total_len = hist_len + input.len();
+
+        let projected_capacity = (input.len() / self.decimation_factor) + 2;
+        output.reserve(projected_capacity);
+
+        let mut idx = self.pending_offset;
+        while idx < hist_len && idx + num_taps <= total_len {
+            let mut sum = Complex::new(0.0f32, 0.0f32);
+            for n in 0..num_taps {
+                let sample_idx = idx + n;
+                let sample = if sample_idx < hist_len {
+                    self.history[sample_idx]
+                } else {
+                    input[sample_idx - hist_len]
+                };
+                sum += sample * self.taps[n];
+            }
+            output.push(sum);
+            idx += self.decimation_factor;
+        }
+
+        while idx + num_taps <= total_len {
+            let input_offset = idx - hist_len;
+            let input_slice = &input[input_offset..input_offset + num_taps];
+            output.push(unsafe { self.compute_aarch64(input_slice) });
+            idx += self.decimation_factor;
+        }
+
+        self.pending_offset = idx.saturating_sub(input.len());
+
+        if input.len() >= hist_len {
+            self.history
+                .copy_from_slice(&input[input.len() - hist_len..]);
+        } else {
+            let shift = hist_len - input.len();
+            self.history.copy_within(input.len().., 0);
+            self.history[shift..].copy_from_slice(input);
+        }
+    }
+
+    pub fn process_scalar(&mut self, input: &[Complex<f32>], output: &mut Vec<Complex<f32>>) {
+        let num_taps = self.taps.len();
+        let hist_len = self.history.len();
+        let total_len = hist_len + input.len();
+
+        let projected_capacity = (input.len() / self.decimation_factor) + 2;
+        output.reserve(projected_capacity);
+
+        let mut idx = self.pending_offset;
+        while idx < hist_len && idx + num_taps <= total_len {
+            let mut sum = Complex::new(0.0f32, 0.0f32);
+            for n in 0..num_taps {
+                let sample_idx = idx + n;
+                let sample = if sample_idx < hist_len {
+                    self.history[sample_idx]
+                } else {
+                    input[sample_idx - hist_len]
+                };
+                sum += sample * self.taps[n];
+            }
+            output.push(sum);
+            idx += self.decimation_factor;
+        }
+
+        while idx + num_taps <= total_len {
+            let input_offset = idx - hist_len;
+            let input_slice = &input[input_offset..input_offset + num_taps];
+            output.push(self.compute_scalar(input_slice));
+            idx += self.decimation_factor;
+        }
+
+        self.pending_offset = idx.saturating_sub(input.len());
+
+        if input.len() >= hist_len {
+            self.history
+                .copy_from_slice(&input[input.len() - hist_len..]);
+        } else {
+            let shift = hist_len - input.len();
+            self.history.copy_within(input.len().., 0);
+            self.history[shift..].copy_from_slice(input);
+        }
+    }
+
+    pub fn process(&mut self, input: &[Complex<f32>], output: &mut Vec<Complex<f32>>) {
+        if self.decimation_factor <= 1 {
+            output.reserve(input.len());
+            output.extend_from_slice(input);
+            return;
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if *HAS_AVX2_FMA {
+            unsafe { self.process_avx2(input, output) };
+            return;
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if *HAS_NEON {
+            unsafe { self.process_neon(input, output) };
+            return;
+        }
+
+        self.process_scalar(input, output);
     }
 }
 
@@ -425,6 +541,67 @@ fn complex_cholesky_solve_6(a: &[[Complex<f32>; 6]; 6], b: &[Complex<f32>; 6]) -
         x[i] = sum / l[i][i].re;
     }
     Some(x)
+}
+
+/// The CLEAN Algorithm (Deconvolution / Orthogonal Matching Pursuit)
+/// Iteratively subtracts 2D point-spread functions (PSF) to expose weak targets/signals.
+pub fn clean_ambiguity_map(
+    map: &mut [Vec<f32>],
+    iterations: usize,
+    loop_gain: f32,
+) -> Vec<(usize, usize, f32)> {
+    let n_rows = map.len();
+    if n_rows == 0 {
+        return vec![];
+    }
+    let n_cols = map[0].len();
+    if n_cols == 0 {
+        return vec![];
+    }
+
+    let mut clean_components = Vec::new();
+    let sigma_row = 2.0f32;
+    let sigma_col = 2.0f32;
+
+    for _ in 0..iterations {
+        // 1. Locate absolute peak
+        let mut max_val = 0.0f32;
+        let mut peak_r = 0;
+        let mut peak_c = 0;
+
+        for r in 0..n_rows {
+            for c in 0..n_cols {
+                let val = map[r][c].abs();
+                if val > max_val {
+                    max_val = val;
+                    peak_r = r;
+                    peak_c = c;
+                }
+            }
+        }
+
+        // Check if peak is too small (e.g. down to noise floor)
+        if max_val < 1e-4 {
+            break;
+        }
+
+        let peak_val = map[peak_r][peak_c];
+        clean_components.push((peak_r, peak_c, peak_val));
+
+        // 2. Subtract ideal 2D Gaussian point-spread function
+        for r in 0..n_rows {
+            let dr = (r as f32 - peak_r as f32).powi(2);
+            for c in 0..n_cols {
+                let dc = (c as f32 - peak_c as f32).powi(2);
+
+                // Ideal 2D Gaussian ambiguity lobe
+                let psf = (-dr / (2.0 * sigma_row.powi(2)) - dc / (2.0 * sigma_col.powi(2))).exp();
+                map[r][c] -= loop_gain * peak_val * psf;
+            }
+        }
+    }
+
+    clean_components
 }
 
 /// Extensive Cancellation Algorithm (ECA) filter
@@ -857,13 +1034,31 @@ impl DigitalDownConverter {
         sample_rate: f64,
         output: &mut [Complex<f32>],
     ) {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                unsafe {
+                    self.process_avx2(input, f_shift, sample_rate, output);
+                    return;
+                }
+            }
+        }
+        self.process_scalar(input, f_shift, sample_rate, output);
+    }
+
+    fn process_scalar(
+        &mut self,
+        input: &[Complex<f32>],
+        f_shift: f64,
+        sample_rate: f64,
+        output: &mut [Complex<f32>],
+    ) {
         if f_shift.abs() < 1e-6 {
             output.copy_from_slice(input);
             return;
         }
 
         let phase_step = -2.0 * std::f64::consts::PI * f_shift / sample_rate;
-        // Use f64 phasor accumulation to prevent magnitude drift from repeated f32 multiplication
         let mut phasor_re = self.phase_acc.cos();
         let mut phasor_im = self.phase_acc.sin();
         let step_re = phase_step.cos();
@@ -879,7 +1074,6 @@ impl DigitalDownConverter {
             phasor_re = new_re;
             phasor_im = new_im;
 
-            // Renormalize every 256 samples to bound accumulated f64 drift
             if n % 256 == 0 {
                 let mag = (phasor_re * phasor_re + phasor_im * phasor_im).sqrt();
                 if mag > 1e-15 {
@@ -887,6 +1081,114 @@ impl DigitalDownConverter {
                     phasor_im /= mag;
                 }
             }
+        }
+
+        self.phase_acc = phasor_im.atan2(phasor_re);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn process_avx2(
+        &mut self,
+        input: &[Complex<f32>],
+        f_shift: f64,
+        sample_rate: f64,
+        output: &mut [Complex<f32>],
+    ) {
+        use std::arch::x86_64::*;
+
+        if f_shift.abs() < 1e-6 {
+            output.copy_from_slice(input);
+            return;
+        }
+
+        let phase_step = -2.0 * std::f64::consts::PI * f_shift / sample_rate;
+        
+        let mut w_re = [0.0f32; 8];
+        let mut w_im = [0.0f32; 8];
+        for k in 0..8 {
+            let angle = (k as f64) * phase_step;
+            w_re[k] = angle.cos() as f32;
+            w_im[k] = angle.sin() as f32;
+        }
+
+        let step_8_re = (8.0 * phase_step).cos();
+        let step_8_im = (8.0 * phase_step).sin();
+
+        let mut phasor_re = self.phase_acc.cos();
+        let mut phasor_im = self.phase_acc.sin();
+
+        let chunks = input.len() / 8;
+        let rem = input.len() % 8;
+
+        let sign_mask = _mm256_set_ps(1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0);
+
+        for c in 0..chunks {
+            let offset = c * 8;
+            
+            let mut p_re = [0.0f32; 8];
+            let mut p_im = [0.0f32; 8];
+            for k in 0..8 {
+                p_re[k] = (phasor_re * w_re[k] as f64 - phasor_im * w_im[k] as f64) as f32;
+                p_im[k] = (phasor_re * w_im[k] as f64 + phasor_im * w_re[k] as f64) as f32;
+            }
+
+            let p_re_low = _mm256_set_ps(
+                p_re[3], p_re[3], p_re[2], p_re[2], p_re[1], p_re[1], p_re[0], p_re[0]
+            );
+            let p_im_low = _mm256_set_ps(
+                p_im[3], p_im[3], p_im[2], p_im[2], p_im[1], p_im[1], p_im[0], p_im[0]
+            );
+            let p_re_high = _mm256_set_ps(
+                p_re[7], p_re[7], p_re[6], p_re[6], p_re[5], p_re[5], p_re[4], p_re[4]
+            );
+            let p_im_high = _mm256_set_ps(
+                p_im[7], p_im[7], p_im[6], p_im[6], p_im[5], p_im[5], p_im[4], p_im[4]
+            );
+
+            let in_ptr = input.as_ptr().add(offset) as *const f32;
+            let in_low = _mm256_loadu_ps(in_ptr);
+            let in_high = _mm256_loadu_ps(in_ptr.add(8));
+
+            let in_low_swapped = _mm256_shuffle_ps(in_low, in_low, 0xB1);
+            let in_low_swapped_signed = _mm256_mul_ps(in_low_swapped, sign_mask);
+            let out_low = _mm256_fmadd_ps(in_low, p_re_low, _mm256_mul_ps(in_low_swapped_signed, p_im_low));
+
+            let in_high_swapped = _mm256_shuffle_ps(in_high, in_high, 0xB1);
+            let in_high_swapped_signed = _mm256_mul_ps(in_high_swapped, sign_mask);
+            let out_high = _mm256_fmadd_ps(in_high, p_re_high, _mm256_mul_ps(in_high_swapped_signed, p_im_high));
+
+            let out_ptr = output.as_mut_ptr().add(offset) as *mut f32;
+            _mm256_storeu_ps(out_ptr, out_low);
+            _mm256_storeu_ps(out_ptr.add(8), out_high);
+
+            let new_re = phasor_re * step_8_re - phasor_im * step_8_im;
+            let new_im = phasor_re * step_8_im + phasor_im * step_8_re;
+            phasor_re = new_re;
+            phasor_im = new_im;
+
+            if c % 32 == 0 {
+                let mag = (phasor_re * phasor_re + phasor_im * phasor_im).sqrt();
+                if mag > 1e-15 {
+                    phasor_re /= mag;
+                    phasor_im /= mag;
+                }
+            }
+        }
+
+        let mut offset = chunks * 8;
+        let step_re = phase_step.cos();
+        let step_im = phase_step.sin();
+        for _ in 0..rem {
+            output[offset] = Complex::new(
+                (input[offset].re as f64 * phasor_re - input[offset].im as f64 * phasor_im) as f32,
+                (input[offset].re as f64 * phasor_im + input[offset].im as f64 * phasor_re) as f32,
+            );
+            let new_re = phasor_re * step_re - phasor_im * step_im;
+            let new_im = phasor_re * step_im + phasor_im * step_re;
+            phasor_re = new_re;
+            phasor_im = new_im;
+            offset += 1;
         }
 
         self.phase_acc = phasor_im.atan2(phasor_re);
@@ -962,6 +1264,10 @@ pub struct DemodChannel {
     pub eca_canceler: EcaCanceler,
     pub is_dual: bool,
     pub current_tec: f64,
+    pub raw_norms: Vec<f64>,
+    pub raw_norms2: Vec<f64>,
+    pub last_carrier_freq_offset: Option<f64>,
+    pub smoothed_free_freq: Option<f64>,
 }
 
 impl DemodChannel {
@@ -1074,6 +1380,10 @@ impl DemodChannel {
             eca_canceler: EcaCanceler::new(),
             is_dual: false,
             current_tec: 0.0,
+            raw_norms: Vec::new(),
+            raw_norms2: Vec::new(),
+            last_carrier_freq_offset: None,
+            smoothed_free_freq: None,
         }
     }
 
@@ -1145,7 +1455,23 @@ impl DemodChannel {
             }
         }
 
+        let freq_to_use = if self.nominal_freq == 0.0 {
+            self.target_freq
+        } else {
+            self.nominal_freq
+        };
+        let f_shift = freq_to_use - center_freq;
+        let dt_block = raw_iq.len() as f64;
+
         if has_nan {
+            let phase_step = -2.0 * std::f64::consts::PI * f_shift / self.sample_rate;
+            self.ddc.phase_acc = (self.ddc.phase_acc + phase_step * dt_block).rem_euclid(2.0 * std::f64::consts::PI);
+            if self.is_dual {
+                let f_shift2 = self.target_freq2 - center_freq;
+                let phase_step2 = -2.0 * std::f64::consts::PI * f_shift2 / self.sample_rate;
+                self.ddc2.phase_acc = (self.ddc2.phase_acc + phase_step2 * dt_block).rem_euclid(2.0 * std::f64::consts::PI);
+            }
+
             self.pll_tracker.is_locked = false;
             self.is_locked = false;
             self.symbol_locked = false;
@@ -1157,6 +1483,14 @@ impl DemodChannel {
 
         // Guard clipping BEFORE DDC to prevent advancing phase_acc on discarded blocks
         if has_clipping {
+            let phase_step = -2.0 * std::f64::consts::PI * f_shift / self.sample_rate;
+            self.ddc.phase_acc = (self.ddc.phase_acc + phase_step * dt_block).rem_euclid(2.0 * std::f64::consts::PI);
+            if self.is_dual {
+                let f_shift2 = self.target_freq2 - center_freq;
+                let phase_step2 = -2.0 * std::f64::consts::PI * f_shift2 / self.sample_rate;
+                self.ddc2.phase_acc = (self.ddc2.phase_acc + phase_step2 * dt_block).rem_euclid(2.0 * std::f64::consts::PI);
+            }
+
             self.pll_tracker.is_locked = false;
             self.is_locked = false;
             self.symbol_locked = false;
@@ -1166,12 +1500,6 @@ impl DemodChannel {
             return;
         }
 
-        let freq_to_use = if self.nominal_freq == 0.0 {
-            self.target_freq
-        } else {
-            self.nominal_freq
-        };
-        let f_shift = freq_to_use - center_freq;
         self.mixed_samples
             .resize(raw_iq.len(), Complex::new(0.0, 0.0));
 
@@ -1280,7 +1608,19 @@ impl DemodChannel {
                 }
             }
 
-            // d. Perform Bussgang Normalization (Constant Modulus Projection) on narrowband decimated signal.
+            // d. Save raw norms for EKF adaptive fading before Bussgang Normalization
+            self.raw_norms.resize(self.decimated_samples.len(), 0.0);
+            for (i, s) in self.decimated_samples.iter().enumerate() {
+                self.raw_norms[i] = s.norm() as f64;
+            }
+            if self.is_dual {
+                self.raw_norms2.resize(self.decimated_samples2.len(), 0.0);
+                for (i, s) in self.decimated_samples2.iter().enumerate() {
+                    self.raw_norms2[i] = s.norm() as f64;
+                }
+            }
+
+            // Perform Bussgang Normalization (Constant Modulus Projection) on narrowband decimated signal.
             // NOTE: This must happen AFTER SNR estimation (which needs amplitude variance)
             // and AFTER ESPRIT bootstrap (which needs spectral amplitude structure),
             // but BEFORE the EKF tracking loop (which benefits from constant-modulus input).
@@ -1318,6 +1658,7 @@ impl DemodChannel {
                                 let prev_ts = tracker.ts;
                                 tracker.ts = decimated_ts;
                                 tracker.predict();
+                                tracker.raw_amp = [self.raw_norms[s_idx], self.raw_norms2[s_idx]];
                                 tracker.update_dual(s, s2);
                                 tracker.ts = prev_ts;
                             } else if self.modulation != Modulation::Carrier && (tracker.ts - decimated_ts).abs() > 1e-9 {
@@ -1348,6 +1689,7 @@ impl DemodChannel {
                                     let prev_ts = tracker.ts;
                                     tracker.ts = 1.0 / self.symbol_rate; // Symbol rate tracking ts scale
                                     tracker.predict();
+                                    tracker.raw_amp = [self.raw_norms[s_idx], 0.0];
                                     tracker.update(sym_raw);
                                     tracker.ts = prev_ts;
                                 }
@@ -1355,6 +1697,7 @@ impl DemodChannel {
                                 let prev_ts = tracker.ts;
                                 tracker.ts = decimated_ts;
                                 tracker.predict();
+                                tracker.raw_amp = [self.raw_norms[s_idx], 0.0];
                                 tracker.update(s);
                                 tracker.ts = prev_ts;
                             }
@@ -1430,8 +1773,8 @@ impl DemodChannel {
                         let f_free = AppletonHartreeDispersion::cancel(self.nominal_freq, self.frequency2, f1_abs, f2_abs);
                         self.frequency = f_free;
 
-                        let theta1 = active_tracker.x[0];
-                        let theta2 = active_tracker.x[3];
+                        let theta1 = active_tracker.unwrapped_phase1;
+                        let theta2 = active_tracker.unwrapped_phase2;
                         if f1 != 0.0 && f2 != 0.0 && (f1 - f2).abs() > 1e-6 {
                             let f1_sq = f1 * f1;
                             let f2_sq = f2 * f2;
@@ -1472,10 +1815,21 @@ impl DemodChannel {
                                 let f1_abs = f1 + fd1;
                                 let f2_abs = f2 + fd2;
                                 let f_free = AppletonHartreeDispersion::cancel(self.nominal_freq, self.frequency2, f1_abs, f2_abs);
-                                self.frequency = f_free;
+                                
+                                let smoothed = match (self.last_carrier_freq_offset, self.smoothed_free_freq) {
+                                    (Some(last_c), Some(last_s)) => {
+                                        let df_c = fd1 - last_c;
+                                        let m = 100.0;
+                                        (1.0 / m) * f_free + ((m - 1.0) / m) * (last_s + df_c)
+                                    }
+                                    _ => f_free,
+                                };
+                                self.last_carrier_freq_offset = Some(fd1);
+                                self.smoothed_free_freq = Some(smoothed);
+                                self.frequency = smoothed;
 
-                                let theta1 = tracker.x[0];
-                                let theta2 = tracker.x[3];
+                                let theta1 = tracker.unwrapped_phase1;
+                                let theta2 = tracker.unwrapped_phase2;
                                 if f1 != 0.0 && f2 != 0.0 && (f1 - f2).abs() > 1e-6 {
                                     let f1_sq = f1 * f1;
                                     let f2_sq = f2 * f2;
@@ -1507,6 +1861,7 @@ impl DemodChannel {
                             let prev_ts = self.pll_tracker.ts;
                             self.pll_tracker.ts = decimated_ts;
                             self.pll_tracker.predict();
+                            self.pll_tracker.raw_amp = [self.raw_norms[s_idx], self.raw_norms2[s_idx]];
                             self.pll_tracker.update_dual(s, s2);
                             self.pll_tracker.ts = prev_ts;
                         } else if self.modulation != Modulation::Carrier && (self.pll_tracker.ts - decimated_ts).abs() > 1e-9 {
@@ -1524,7 +1879,7 @@ impl DemodChannel {
                                 let dt_sample = decimated_ts;
                                 let true_theta =
                                     theta - (self.pll_tracker.x[1] / scale) * (3.0 - mu as f64) * dt_sample;
-                                  let cos_inv = true_theta.cos();
+                                let cos_inv = true_theta.cos();
                                 let sin_inv = true_theta.sin();
                                 let sym_raw = Complex::new(
                                     (sym_derot.re as f64 * cos_inv - sym_derot.im as f64 * sin_inv)
@@ -1535,6 +1890,7 @@ impl DemodChannel {
                                 let prev_ts = self.pll_tracker.ts;
                                 self.pll_tracker.ts = 1.0 / self.symbol_rate;
                                 self.pll_tracker.predict();
+                                self.pll_tracker.raw_amp = [self.raw_norms[s_idx], 0.0];
                                 self.pll_tracker.update(sym_raw);
                                 self.pll_tracker.ts = prev_ts;
                             }
@@ -1542,6 +1898,7 @@ impl DemodChannel {
                             let prev_ts = self.pll_tracker.ts;
                             self.pll_tracker.ts = decimated_ts;
                             self.pll_tracker.predict();
+                            self.pll_tracker.raw_amp = [self.raw_norms[s_idx], 0.0];
                             self.pll_tracker.update(s);
                             self.pll_tracker.ts = prev_ts;
                         }
@@ -1563,10 +1920,21 @@ impl DemodChannel {
                         let f1_abs = f1 + fd1;
                         let f2_abs = f2 + fd2;
                         let f_free = AppletonHartreeDispersion::cancel(self.nominal_freq, self.frequency2, f1_abs, f2_abs);
-                        self.frequency = f_free;
+                        
+                        let smoothed = match (self.last_carrier_freq_offset, self.smoothed_free_freq) {
+                            (Some(last_c), Some(last_s)) => {
+                                let df_c = fd1 - last_c;
+                                let m = 100.0;
+                                (1.0 / m) * f_free + ((m - 1.0) / m) * (last_s + df_c)
+                            }
+                            _ => f_free,
+                        };
+                        self.last_carrier_freq_offset = Some(fd1);
+                        self.smoothed_free_freq = Some(smoothed);
+                        self.frequency = smoothed;
 
-                        let theta1 = self.pll_tracker.x[0];
-                        let theta2 = self.pll_tracker.x[3];
+                        let theta1 = self.pll_tracker.unwrapped_phase1;
+                        let theta2 = self.pll_tracker.unwrapped_phase2;
                         if f1 != 0.0 && f2 != 0.0 && (f1 - f2).abs() > 1e-6 {
                             let f1_sq = f1 * f1;
                             let f2_sq = f2 * f2;
@@ -1657,6 +2025,8 @@ impl DemodChannel {
         self.decimated_samples.clear();
         self.last_processed_len = 0;
         self.sample_count = 0;
+        self.last_carrier_freq_offset = None;
+        self.smoothed_free_freq = None;
     }
 }
 

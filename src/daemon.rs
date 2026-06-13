@@ -139,11 +139,11 @@ fn write_to_ntp_shm(shm_unit: usize, target_adjustment: f64) -> Result<(), Strin
     unsafe {
         std::ptr::write_volatile(&mut (*shm_ptr).mode, 1);
         std::ptr::write_volatile(&mut (*shm_ptr).valid, 0);
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 
         let count = std::ptr::read_volatile(&(*shm_ptr).count);
         std::ptr::write_volatile(&mut (*shm_ptr).count, count.wrapping_add(1));
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 
         std::ptr::write_volatile(&mut (*shm_ptr).clock_time_stamp_sec, clock_sec);
         std::ptr::write_volatile(&mut (*shm_ptr).clock_time_stamp_usec, clock_usec);
@@ -154,10 +154,10 @@ fn write_to_ntp_shm(shm_unit: usize, target_adjustment: f64) -> Result<(), Strin
         std::ptr::write_volatile(&mut (*shm_ptr).leap, 0);
         std::ptr::write_volatile(&mut (*shm_ptr).precision, -20);
         std::ptr::write_volatile(&mut (*shm_ptr).nsamples, 1);
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 
         std::ptr::write_volatile(&mut (*shm_ptr).count, count.wrapping_add(2));
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 
         std::ptr::write_volatile(&mut (*shm_ptr).valid, 1);
     }
@@ -444,16 +444,21 @@ pub struct CompletedPassData {
 }
 
 pub struct ConsensusSteeringEngine {
-    pub passes: Vec<CompletedPassData>,
+    pub passes: std::collections::VecDeque<CompletedPassData>,
 }
 
 impl ConsensusSteeringEngine {
     pub fn new() -> Self {
-        Self { passes: Vec::new() }
+        Self {
+            passes: std::collections::VecDeque::new(),
+        }
     }
 
     pub fn add_pass_result(&mut self, pass: CompletedPassData) {
-        self.passes.push(pass);
+        self.passes.push_back(pass);
+        if self.passes.len() > 50 {
+            self.passes.pop_front();
+        }
     }
 
     pub fn get_consensus_update(&self) -> Option<(f64, f64)> {
@@ -480,7 +485,9 @@ impl ConsensusSteeringEngine {
 
             if weight > 0.0 {
                 total_weight += weight;
-                weighted_offset += pass.offset_seconds * weight;
+                let elapsed = (chrono::Utc::now() - pass.timestamp).num_seconds().max(0) as f64;
+                let extrapolated_offset = pass.offset_seconds + (pass.freq_drift_ppm * 1e-6 * elapsed);
+                weighted_offset += extrapolated_offset * weight;
                 weighted_drift += pass.freq_drift_ppm * weight;
             }
         }

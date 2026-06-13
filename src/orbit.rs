@@ -104,6 +104,44 @@ pub fn enu_to_az_el(enu: [f64; 3]) -> (f64, f64) {
     (az, el)
 }
 
+pub fn apply_sagnac_correction(
+    pos_sat: [f64; 3],
+    vel_sat: [f64; 3],
+    pos_obs: [f64; 3],
+) -> ([f64; 3], [f64; 3]) {
+    let dx = pos_sat[0] - pos_obs[0];
+    let dy = pos_sat[1] - pos_obs[1];
+    let dz = pos_sat[2] - pos_obs[2];
+    let range = (dx * dx + dy * dy + dz * dz).sqrt();
+    if range > 0.0 {
+        let tau = range / 299792458.0;
+        let omega_e = 7.2921151467e-5;
+        let theta_sagnac = -omega_e * tau;
+        let cos_t = theta_sagnac.cos();
+        let sin_t = theta_sagnac.sin();
+        let p_corr = [
+            pos_sat[0] * cos_t + pos_sat[1] * sin_t,
+            -pos_sat[0] * sin_t + pos_sat[1] * cos_t,
+            pos_sat[2],
+        ];
+        let v_corr = [
+            vel_sat[0] * cos_t + vel_sat[1] * sin_t,
+            -vel_sat[0] * sin_t + vel_sat[1] * cos_t,
+            vel_sat[2],
+        ];
+        (p_corr, v_corr)
+    } else {
+        (pos_sat, vel_sat)
+    }
+}
+
+pub fn saastamoinen_tropospheric_delay(sat_ecef: [f64; 3], obs_ecef: [f64; 3]) -> f64 {
+    let enu = ecef_to_enu(sat_ecef, obs_ecef);
+    let (_, el) = enu_to_az_el(enu);
+    let sin_el = el.sin().max(0.01);
+    2.3 / (sin_el + 0.00143)
+}
+
 pub fn solve_linear_system(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
     let n = b.len();
     for i in 0..n {
@@ -152,12 +190,13 @@ pub fn predict_freq_sample(
 ) -> Option<f64> {
     let dt_true = dt - chrono::Duration::microseconds((delta_t * 1e6) as i64);
     if let Some((pos_sat, vel_sat)) = orbit.propagate_ecef(dt_true) {
-        let rx = pos_sat[0] - pos_obs[0];
-        let ry = pos_sat[1] - pos_obs[1];
-        let rz = pos_sat[2] - pos_obs[2];
+        let (pos_sat_corr, vel_sat_corr) = apply_sagnac_correction(pos_sat, vel_sat, pos_obs);
+        let rx = pos_sat_corr[0] - pos_obs[0];
+        let ry = pos_sat_corr[1] - pos_obs[1];
+        let rz = pos_sat_corr[2] - pos_obs[2];
         let range = (rx * rx + ry * ry + rz * rz).sqrt();
         if range > 0.0 {
-            let range_rate = (rx * vel_sat[0] + ry * vel_sat[1] + rz * vel_sat[2]) / range;
+            let range_rate = (rx * vel_sat_corr[0] + ry * vel_sat_corr[1] + rz * vel_sat_corr[2]) / range;
             let doppler_term = 1.0 - range_rate / 299792458.0;
             return Some(df0 + center_freq * doppler_term);
         }
@@ -1074,7 +1113,7 @@ pub fn run_blind_solver_check(
     }
 }
 
-pub fn datetime_to_jd(dt: DateTime<Utc>) -> f64 {
+pub fn datetime_to_jd(dt: DateTime<Utc>) -> (f64, f64) {
     let year = dt.year() as f64;
     let month = dt.month() as f64;
     let day = dt.day() as f64;
@@ -1084,7 +1123,6 @@ pub fn datetime_to_jd(dt: DateTime<Utc>) -> f64 {
     let nanosecond = dt.nanosecond() as f64;
 
     let day_fraction = (hour + (minute + (second + nanosecond / 1e9) / 60.0) / 60.0) / 24.0;
-    let jd_day = day + day_fraction;
 
     let (y, m) = if month <= 2.0 {
         (year - 1.0, month + 12.0)
@@ -1095,11 +1133,12 @@ pub fn datetime_to_jd(dt: DateTime<Utc>) -> f64 {
     let a = (y / 100.0).floor();
     let b = 2.0 - a + (a / 4.0).floor();
 
-    (365.25 * (y + 4716.0)).floor() + (30.6001 * (m + 1.0)).floor() + jd_day + b - 1524.5
+    let jd_base = (365.25 * (y + 4716.0)).floor() + (30.6001 * (m + 1.0)).floor() + day + b - 1524.5;
+    (jd_base, day_fraction)
 }
 
-pub fn teme_to_ecef(jd: f64, pos_teme: [f64; 3], vel_teme: [f64; 3]) -> ([f64; 3], [f64; 3]) {
-    let d = jd - 2451545.0;
+pub fn teme_to_ecef(jd: (f64, f64), pos_teme: [f64; 3], vel_teme: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+    let d = (jd.0 - 2451545.0) + jd.1;
     let t = d / 36525.0;
     let mut gmst =
         280.46061837 + 360.98564736629 * d + 0.000387933 * t * t - t * t * t / 38710000.0;
@@ -1447,11 +1486,12 @@ pub fn fit_satellite(
             for &(dt, freq_meas) in data {
                 let dt_true = dt - chrono::Duration::microseconds((delta_t * 1e6) as i64);
                 if let Some((pos_sat, vel_sat)) = orbit.propagate_ecef(dt_true) {
-                    let rx = pos_sat[0] - pos_obs[0];
-                    let ry = pos_sat[1] - pos_obs[1];
-                    let rz = pos_sat[2] - pos_obs[2];
+                    let (pos_sat_corr, vel_sat_corr) = apply_sagnac_correction(pos_sat, vel_sat, pos_obs);
+                    let rx = pos_sat_corr[0] - pos_obs[0];
+                    let ry = pos_sat_corr[1] - pos_obs[1];
+                    let rz = pos_sat_corr[2] - pos_obs[2];
                     let range = (rx * rx + ry * ry + rz * rz).sqrt();
-                    let range_rate = (rx * vel_sat[0] + ry * vel_sat[1] + rz * vel_sat[2]) / range;
+                    let range_rate = (rx * vel_sat_corr[0] + ry * vel_sat_corr[1] + rz * vel_sat_corr[2]) / range;
 
                     let doppler_term = 1.0 - range_rate / 299792458.0;
                     y.push(freq_meas - center_freq * doppler_term);
@@ -1496,11 +1536,12 @@ pub fn fit_satellite(
             for &(dt, freq_meas) in data {
                 let dt_true = dt - chrono::Duration::microseconds((delta_t * 1e6) as i64);
                 if let Some((pos_sat, vel_sat)) = orbit.propagate_ecef(dt_true) {
-                    let rx = pos_sat[0] - pos_obs[0];
-                    let ry = pos_sat[1] - pos_obs[1];
-                    let rz = pos_sat[2] - pos_obs[2];
+                    let (pos_sat_corr, vel_sat_corr) = apply_sagnac_correction(pos_sat, vel_sat, pos_obs);
+                    let rx = pos_sat_corr[0] - pos_obs[0];
+                    let ry = pos_sat_corr[1] - pos_obs[1];
+                    let rz = pos_sat_corr[2] - pos_obs[2];
                     let range = (rx * rx + ry * ry + rz * rz).sqrt();
-                    let range_rate = (rx * vel_sat[0] + ry * vel_sat[1] + rz * vel_sat[2]) / range;
+                    let range_rate = (rx * vel_sat_corr[0] + ry * vel_sat_corr[1] + rz * vel_sat_corr[2]) / range;
                     let doppler_term = 1.0 - range_rate / 299792458.0;
 
                     y.push(freq_meas - center_freq * doppler_term);
@@ -1544,11 +1585,12 @@ pub fn fit_satellite(
             for &(dt, freq_meas) in data {
                 let dt_true = dt - chrono::Duration::microseconds((delta_t * 1e6) as i64);
                 if let Some((pos_sat, vel_sat)) = orbit.propagate_ecef(dt_true) {
-                    let rx = pos_sat[0] - pos_obs[0];
-                    let ry = pos_sat[1] - pos_obs[1];
-                    let rz = pos_sat[2] - pos_obs[2];
+                    let (pos_sat_corr, vel_sat_corr) = apply_sagnac_correction(pos_sat, vel_sat, pos_obs);
+                    let rx = pos_sat_corr[0] - pos_obs[0];
+                    let ry = pos_sat_corr[1] - pos_obs[1];
+                    let rz = pos_sat_corr[2] - pos_obs[2];
                     let range = (rx * rx + ry * ry + rz * rz).sqrt();
-                    let range_rate = (rx * vel_sat[0] + ry * vel_sat[1] + rz * vel_sat[2]) / range;
+                    let range_rate = (rx * vel_sat_corr[0] + ry * vel_sat_corr[1] + rz * vel_sat_corr[2]) / range;
                     let doppler_term = 1.0 - range_rate / 299792458.0;
 
                     y.push(freq_meas - center_freq * doppler_term);
@@ -1650,6 +1692,7 @@ pub struct GeodeticCoordinates {
 /// Requires ≥4 simultaneous satellite range measurements to solve for 3D position.
 pub struct RealTimeGeoSolver {
     pub initial_guess: ECEFCoordinates,
+    pub apply_troposphere: bool,
 }
 
 impl RealTimeGeoSolver {
@@ -1661,6 +1704,7 @@ impl RealTimeGeoSolver {
                 y: 0.0,
                 z: 6378137.0, // WGS84 semi-major axis
             },
+            apply_troposphere: false,
         }
     }
 
@@ -1739,7 +1783,12 @@ impl RealTimeGeoSolver {
                     continue;
                 }
 
-                let residual = dist - range;
+                let delta_trop = if self.apply_troposphere {
+                    saastamoinen_tropospheric_delay([sat.x, sat.y, sat.z], [x, y, z])
+                } else {
+                    0.0
+                };
+                let residual = dist - (range - delta_trop);
                 let jx = dx / dist;
                 let jy = dy / dist;
                 let jz = dz / dist;

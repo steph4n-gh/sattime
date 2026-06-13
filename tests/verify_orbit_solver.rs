@@ -3,7 +3,7 @@ use chrono::{DateTime, Datelike, Timelike, Utc};
 // Mock/helper implementations of coordinate functions so orbit_solver compiles
 pub mod orbit {
     use super::*;
-    pub fn datetime_to_jd(dt: DateTime<Utc>) -> f64 {
+    pub fn datetime_to_jd(dt: DateTime<Utc>) -> (f64, f64) {
         let year = dt.year() as f64;
         let month = dt.month() as f64;
         let day = dt.day() as f64;
@@ -13,7 +13,6 @@ pub mod orbit {
         let nanosecond = dt.nanosecond() as f64;
 
         let day_fraction = (hour + (minute + (second + nanosecond / 1e9) / 60.0) / 60.0) / 24.0;
-        let jd_day = day + day_fraction;
 
         let (y, m) = if month <= 2.0 {
             (year - 1.0, month + 12.0)
@@ -24,11 +23,12 @@ pub mod orbit {
         let a = (y / 100.0).floor();
         let b = 2.0 - a + (a / 4.0).floor();
 
-        (365.25 * (y + 4716.0)).floor() + (30.6001 * (m + 1.0)).floor() + jd_day + b - 1524.5
+        let jd_base = (365.25 * (y + 4716.0)).floor() + (30.6001 * (m + 1.0)).floor() + day + b - 1524.5;
+        (jd_base, day_fraction)
     }
 
-    pub fn teme_to_ecef(jd: f64, pos_teme: [f64; 3], vel_teme: [f64; 3]) -> ([f64; 3], [f64; 3]) {
-        let d = jd - 2451545.0;
+    pub fn teme_to_ecef(jd: (f64, f64), pos_teme: [f64; 3], vel_teme: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+        let d = (jd.0 - 2451545.0) + jd.1;
         let t = d / 36525.0;
         let mut gmst =
             280.46061837 + 360.98564736629 * d + 0.000387933 * t * t - t * t * t / 38710000.0;
@@ -54,6 +54,37 @@ pub mod orbit {
         let vz_ecef = vel_teme[2];
 
         ([x_ecef, y_ecef, z_ecef], [vx_ecef, vy_ecef, vz_ecef])
+    }
+
+    pub fn apply_sagnac_correction(
+        pos_sat: [f64; 3],
+        vel_sat: [f64; 3],
+        pos_obs: [f64; 3],
+    ) -> ([f64; 3], [f64; 3]) {
+        let dx = pos_sat[0] - pos_obs[0];
+        let dy = pos_sat[1] - pos_obs[1];
+        let dz = pos_sat[2] - pos_obs[2];
+        let range = (dx * dx + dy * dy + dz * dz).sqrt();
+        if range > 0.0 {
+            let tau = range / 299792458.0;
+            let omega_e = 7.2921151467e-5;
+            let theta_sagnac = -omega_e * tau;
+            let cos_t = theta_sagnac.cos();
+            let sin_t = theta_sagnac.sin();
+            let p_corr = [
+                pos_sat[0] * cos_t + pos_sat[1] * sin_t,
+                -pos_sat[0] * sin_t + pos_sat[1] * cos_t,
+                pos_sat[2],
+            ];
+            let v_corr = [
+                vel_sat[0] * cos_t + vel_sat[1] * sin_t,
+                -vel_sat[0] * sin_t + vel_sat[1] * cos_t,
+                vel_sat[2],
+            ];
+            (p_corr, v_corr)
+        } else {
+            (pos_sat, vel_sat)
+        }
     }
 
     pub fn wgs84_to_ecef(lat_deg: f64, lon_deg: f64, alt_m: f64) -> [f64; 3] {

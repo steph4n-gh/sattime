@@ -1,4 +1,4 @@
-use crate::orbit::{datetime_to_jd, teme_to_ecef};
+use crate::orbit::{datetime_to_jd, teme_to_ecef, apply_sagnac_correction};
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use rayon::prelude::*;
 use std::fs::File;
@@ -280,23 +280,25 @@ pub fn predict_frequency(
     let t_corr = t_adj + chrono::Duration::nanoseconds((dt_rel * 1e9) as i64);
     let (pos_sat, vel_sat) = propagate_ecef_at_time(a, i, raan0, u0, epoch, t_corr, t_obs);
 
-    let dx = pos_sat[0] - rec_ecef[0];
-    let dy = pos_sat[1] - rec_ecef[1];
-    let dz = pos_sat[2] - rec_ecef[2];
+    let (pos_sat_corr, vel_sat_corr) = apply_sagnac_correction(pos_sat, vel_sat, rec_ecef);
+
+    let dx = pos_sat_corr[0] - rec_ecef[0];
+    let dy = pos_sat_corr[1] - rec_ecef[1];
+    let dz = pos_sat_corr[2] - rec_ecef[2];
     let dist = (dx * dx + dy * dy + dz * dz).sqrt();
 
     if dist < 1.0 {
         return center_freq + df;
     }
 
-    let v_sat_sq = vel_sat[0] * vel_sat[0] + vel_sat[1] * vel_sat[1] + vel_sat[2] * vel_sat[2];
-    let r_sat = (pos_sat[0] * pos_sat[0] + pos_sat[1] * pos_sat[1] + pos_sat[2] * pos_sat[2]).sqrt();
+    let v_sat_sq = vel_sat_corr[0] * vel_sat_corr[0] + vel_sat_corr[1] * vel_sat_corr[1] + vel_sat_corr[2] * vel_sat_corr[2];
+    let r_sat = (pos_sat_corr[0] * pos_sat_corr[0] + pos_sat_corr[1] * pos_sat_corr[1] + pos_sat_corr[2] * pos_sat_corr[2]).sqrt();
     let r_rec = (rec_ecef[0] * rec_ecef[0] + rec_ecef[1] * rec_ecef[1] + rec_ecef[2] * rec_ecef[2]).sqrt();
 
     let u_sat = -MU / r_sat;
     let u_rec = -MU / r_rec;
 
-    let v_dot_n = (vel_sat[0] * dx + vel_sat[1] * dy + vel_sat[2] * dz) / dist;
+    let v_dot_n = (vel_sat_corr[0] * dx + vel_sat_corr[1] * dy + vel_sat_corr[2] * dz) / dist;
 
     let gamma_inv = (1.0 - v_sat_sq / (C * C)).sqrt();
     let denominator = 1.0 - v_dot_n / C;
@@ -329,23 +331,25 @@ pub fn predict_frequency_poly(
     let t_corr = t_adj + chrono::Duration::nanoseconds((dt_rel * 1e9) as i64);
     let (pos_sat, vel_sat) = propagate_ecef_at_time(a, i, raan0, u0, epoch, t_corr, t_obs);
 
-    let dx = pos_sat[0] - rec_ecef[0];
-    let dy = pos_sat[1] - rec_ecef[1];
-    let dz = pos_sat[2] - rec_ecef[2];
+    let (pos_sat_corr, vel_sat_corr) = apply_sagnac_correction(pos_sat, vel_sat, rec_ecef);
+
+    let dx = pos_sat_corr[0] - rec_ecef[0];
+    let dy = pos_sat_corr[1] - rec_ecef[1];
+    let dz = pos_sat_corr[2] - rec_ecef[2];
     let dist = (dx * dx + dy * dy + dz * dz).sqrt();
 
     if dist < 1.0 {
         return center_freq + df_poly.0;
     }
 
-    let v_sat_sq = vel_sat[0] * vel_sat[0] + vel_sat[1] * vel_sat[1] + vel_sat[2] * vel_sat[2];
-    let r_sat = (pos_sat[0] * pos_sat[0] + pos_sat[1] * pos_sat[1] + pos_sat[2] * pos_sat[2]).sqrt();
+    let v_sat_sq = vel_sat_corr[0] * vel_sat_corr[0] + vel_sat_corr[1] * vel_sat_corr[1] + vel_sat_corr[2] * vel_sat_corr[2];
+    let r_sat = (pos_sat_corr[0] * pos_sat_corr[0] + pos_sat_corr[1] * pos_sat_corr[1] + pos_sat_corr[2] * pos_sat_corr[2]).sqrt();
     let r_rec = (rec_ecef[0] * rec_ecef[0] + rec_ecef[1] * rec_ecef[1] + rec_ecef[2] * rec_ecef[2]).sqrt();
 
     let u_sat = -MU / r_sat;
     let u_rec = -MU / r_rec;
 
-    let v_dot_n = (vel_sat[0] * dx + vel_sat[1] * dy + vel_sat[2] * dz) / dist;
+    let v_dot_n = (vel_sat_corr[0] * dx + vel_sat_corr[1] * dy + vel_sat_corr[2] * dz) / dist;
 
     let gamma_inv = (1.0 - v_sat_sq / (C * C)).sqrt();
     let denominator = 1.0 - v_dot_n / C;
@@ -357,6 +361,154 @@ pub fn predict_frequency_poly(
     f_obs - center_freq + bias
 }
 
+
+pub struct AdelicLangevinOptimizer {
+    primes: Vec<u64>,
+}
+
+impl AdelicLangevinOptimizer {
+    pub fn new() -> Self {
+        Self {
+            primes: vec![2, 3, 5, 7],
+        }
+    }
+
+    pub fn optimize<F>(
+        &mut self,
+        initial_state: [f64; 4],
+        bounds: &[(f64, f64); 4],
+        mut cost_fn: F,
+        steps: usize,
+        rng: &mut SimpleRng,
+    ) -> ([f64; 4], f64)
+    where
+        F: FnMut(&[f64; 4]) -> f64,
+    {
+        let mut current_state = initial_state;
+        let mut current_rss = cost_fn(&current_state);
+
+        let mut best_state = current_state;
+        let mut best_rss = current_rss;
+
+        let mut lr = 0.1;
+        let mut noise_std = 0.05;
+
+        let mut rss_history = Vec::with_capacity(steps);
+
+        for step in 0..steps {
+            rss_history.push(current_rss);
+
+            // 1. Compute numerical gradient
+            let mut grad = [0.0; 4];
+            for i in 0..4 {
+                let eps = if i == 0 { 1000.0 } else { 1e-4 };
+                let mut state_plus = current_state;
+                state_plus[i] += eps;
+                let rss_plus = cost_fn(&state_plus);
+
+                let mut state_minus = current_state;
+                state_minus[i] -= eps;
+                let rss_minus = cost_fn(&state_minus);
+
+                grad[i] = (rss_plus - rss_minus) / (2.0 * eps);
+            }
+
+            // 2. Perform Langevin step
+            let mut next_state = current_state;
+            for i in 0..4 {
+                let grad_sign = if grad[i].is_nan() { 0.0 } else { grad[i].signum() };
+                
+                let (grad_scale, noise_scale) = if i == 0 {
+                    (1000.0, 10.0)
+                } else if i == 1 {
+                    (0.01, 0.001)
+                } else {
+                    (0.2, 0.05)
+                };
+
+                let noise = rng.next_gaussian() * noise_std * noise_scale;
+                next_state[i] = current_state[i] - lr * grad_sign * grad_scale + noise;
+                next_state[i] = next_state[i].clamp(bounds[i].0, bounds[i].1);
+            }
+
+            let next_rss = cost_fn(&next_state);
+            if next_rss < current_rss {
+                current_state = next_state;
+                current_rss = next_rss;
+            }
+
+            // 3. Adelic Jump (only perturb periodic parameters raan0 and u0)
+            let p = self.primes[step % self.primes.len()];
+            let mut jump_state = current_state;
+
+            for i in 2..4 {
+                let range = bounds[i].1 - bounds[i].0;
+                if range > 0.0 {
+                    let val_normalized = ((current_state[i] - bounds[i].0) / range).clamp(0.0, 0.99999);
+                    let p_adic_val = inverse_monna_map(val_normalized, p, 16);
+
+                    let perturb_scale = 4;
+                    let perturbation = (rng.next_f64() * (p as f64).powi(perturb_scale)) as u64;
+                    let perturbed_p_adic = p_adic_val.wrapping_add(perturbation);
+
+                    let val_jump_normalized = monna_map(perturbed_p_adic, p);
+                    let val_jump = bounds[i].0 + val_jump_normalized * range;
+                    jump_state[i] = val_jump.clamp(bounds[i].0, bounds[i].1);
+                }
+            }
+
+            let jump_rss = cost_fn(&jump_state);
+            
+            // Regularization check based on historical variation
+            let mut current_diffs = Vec::new();
+            if rss_history.len() >= 2 {
+                for j in 1..rss_history.len() {
+                    let prev = rss_history[j - 1];
+                    let curr = rss_history[j];
+                    if prev > 0.0 {
+                        current_diffs.push((curr - prev) / prev);
+                    } else {
+                        current_diffs.push(0.0);
+                    }
+                }
+            }
+            let current_var_sum: f64 = current_diffs.iter().map(|d| d.abs()).sum();
+            let reg_rss_current = current_rss + 0.01 * current_var_sum;
+
+            let mut temp_history = rss_history.clone();
+            temp_history.push(jump_rss);
+            let mut jump_diffs = Vec::new();
+            if temp_history.len() >= 2 {
+                for j in 1..temp_history.len() {
+                    let prev = temp_history[j - 1];
+                    let curr = temp_history[j];
+                    if prev > 0.0 {
+                        jump_diffs.push((curr - prev) / prev);
+                    } else {
+                        jump_diffs.push(0.0);
+                    }
+                }
+            }
+            let jump_var_sum: f64 = jump_diffs.iter().map(|d| d.abs()).sum();
+            let reg_rss_jump = jump_rss + 0.01 * jump_var_sum;
+
+            if reg_rss_jump < reg_rss_current {
+                current_state = jump_state;
+                current_rss = jump_rss;
+            }
+
+            if current_rss < best_rss {
+                best_rss = current_rss;
+                best_state = current_state;
+            }
+
+            lr *= 0.95;
+            noise_std *= 0.9;
+        }
+
+        (best_state, best_rss)
+    }
+}
 
 // Formulate the Keplerian parameters Levenberg-Marquardt solver
 pub fn fit_orbit_doppler(
@@ -424,27 +576,44 @@ pub fn fit_orbit_doppler(
     }
 
     let a_est = if obs_pcas.len() >= 2 {
-        let mut t_obs_sum = 0.0;
-        let mut t_obs_count = 0.0;
-        let t0 = obs_pcas[0];
-        for &tp in &obs_pcas[1..] {
-            let dt = (tp - t0).num_milliseconds() as f64 / 1000.0;
-            let k = (dt / 5700.0).round();
-            println!("DEBUG: dt={}, k={}, dt/k={}", dt, k, dt / k);
-            if k > 0.0 {
-                t_obs_sum += dt / k;
-                t_obs_count += 1.0;
+        let t_expected_sidereal = 2.0 * std::f64::consts::PI * (initial_a.powi(3) / MU).sqrt();
+        let cos_i = initial_i.cos();
+        let omega_e = 7.2921151467e-5;
+        let t_expected_synodic = t_expected_sidereal / (1.0 - (omega_e * t_expected_sidereal / (2.0 * std::f64::consts::PI)) * cos_i);
+
+        let mut best_dt_k = 0.0;
+        let mut min_score = f64::MAX;
+
+        for i in 0..obs_pcas.len() {
+            for j in i + 1..obs_pcas.len() {
+                let dt = (obs_pcas[j] - obs_pcas[i]).num_milliseconds() as f64 / 1000.0;
+                let k = (dt / t_expected_synodic).round();
+                if k > 0.0 {
+                    let dt_k = dt / k;
+                    let diff = (dt_k - t_expected_synodic).abs();
+                    // Prioritize smaller k, and then smaller difference from expected synodic period
+                    let score = k * 1000.0 + diff;
+                    if score < min_score {
+                        min_score = score;
+                        best_dt_k = dt_k;
+                    }
+                }
             }
         }
-        let t_observed = if t_obs_count > 0.0 {
-            t_obs_sum / t_obs_count
+
+        let t_observed = if best_dt_k > 0.0 {
+            best_dt_k
         } else {
-            5700.0
+            t_expected_synodic
         };
-        let a_val = (MU * t_observed * t_observed
+
+        // Convert synodic t_observed to sidereal t_corrected
+        let t_corrected = t_observed / (1.0 + (omega_e * t_observed / (2.0 * std::f64::consts::PI)) * cos_i);
+
+        let a_val = (MU * t_corrected * t_corrected
             / (4.0 * std::f64::consts::PI * std::f64::consts::PI))
             .powf(1.0 / 3.0);
-        println!("DEBUG: t_observed={}, a_est={}", t_observed, a_val);
+        println!("DEBUG: t_observed_synodic={}, t_corrected_sidereal={}, a_est={}", t_observed, t_corrected, a_val);
         a_val.max(6500e3).min(20000e3)
     } else {
         initial_a
@@ -453,13 +622,12 @@ pub fn fit_orbit_doppler(
     // --- STAGE 1: Fit using only the first 2 passes to get close to true a and i ---
     let stage1_passes = &raw_passes[0..2];
     let mut stage1_params = vec![0.0; 4 + 2 * 2]; // 4 global + 2 * 2 pass-specific = 8 params
-    stage1_params[0] = a_est;
+    stage1_params[0] = initial_a;
     stage1_params[1] = initial_i;
 
     // Run Langevin Global Optimizer on the first 2 passes to get raan0 and u0
-    let mut best_raan0 = 0.0_f64;
-    let mut best_u0 = 0.0_f64;
-    let mut best_rss = f64::MAX;
+    // Run Adelic Langevin Global Optimizer on the first 2 passes to get global Keplerian elements
+
 
 
     // 12x12 grid of starting points for Langevin trajectories (30 degree spacing)
@@ -472,7 +640,8 @@ pub fn fit_orbit_doppler(
     let mut rng = SimpleRng::new(1337);
     for &init_raan in &grid_points {
         for &init_u0 in &grid_points {
-            starts.push((init_raan, init_u0, rng.state));
+            starts.push((initial_a, init_raan, init_u0, rng.state));
+            starts.push((a_est, init_raan, init_u0, rng.state));
             for _ in 0..75 {
                 rng.next_f64();
             }
@@ -485,248 +654,113 @@ pub fn fit_orbit_doppler(
         .build()
         .unwrap();
 
-    let results: Vec<((f64, f64), f64, Vec<f64>)> = pool.install(|| {
+    let results: Vec<([f64; 4], f64)> = pool.install(|| {
         starts
             .into_par_iter()
-            .map(|(init_raan, init_u0, seed_state)| {
-                let mut raan0 = init_raan;
-                let mut u0 = init_u0;
-                let mut traj_best_raan = raan0;
-                let mut traj_best_u = u0;
-                let mut traj_best_rss = f64::MAX;
-
+            .map(|(start_a, init_raan, init_u0, seed_state)| {
                 let mut rng = SimpleRng { state: seed_state };
-
-                let mut lr = 0.1;
-                let mut noise_std = 0.05;
-
-                let mut rss_history = Vec::new();
-
-                for step in 0..15 {
-                    let current_rss = compute_rss(
+                let mut opt = AdelicLangevinOptimizer::new();
+                let bounds = [
+                    (start_a, start_a), // a
+                    (initial_i, initial_i), // i
+                    (0.0, 2.0 * std::f64::consts::PI), // raan0
+                    (0.0, 2.0 * std::f64::consts::PI), // u0
+                ];
+                let cost_fn = |state: &[f64; 4]| {
+                    compute_rss(
                         stage1_passes,
                         rec_ecef,
-                        stage1_params[0],
-                        stage1_params[1],
+                        state[0],
+                        state[1],
                         epoch,
                         center_freq,
-                        raan0,
-                        u0,
-                    );
-                    rss_history.push(current_rss);
-                    if current_rss < traj_best_rss {
-                        traj_best_rss = current_rss;
-                        traj_best_raan = raan0;
-                        traj_best_u = u0;
-                    }
-
-                    // Compute gradient
-                    let (_, _, grad_raan, grad_u0) = compute_gradient(
-                        stage1_passes,
-                        rec_ecef,
-                        stage1_params[0],
-                        stage1_params[1],
-                        epoch,
-                        center_freq,
-                        raan0,
-                        u0,
-                    );
-
-                    let sign_raan = if grad_raan.is_nan() {
-                        0.0
-                    } else {
-                        grad_raan.signum()
-                    };
-                    let sign_u0 = if grad_u0.is_nan() {
-                        0.0
-                    } else {
-                        grad_u0.signum()
-                    };
-
-                    // Update directions
-                    let step_raan = -lr * sign_raan * 0.2 + noise_std * rng.next_gaussian() * 0.05;
-                    let step_u0 = -lr * sign_u0 * 0.2 + noise_std * rng.next_gaussian() * 0.05;
-
-                    let next_raan0 = (raan0 + step_raan).rem_euclid(2.0 * std::f64::consts::PI);
-                    let next_u0 = (u0 + step_u0).rem_euclid(2.0 * std::f64::consts::PI);
-
-                    raan0 = next_raan0;
-                    u0 = next_u0;
-
-                    // Digit-scrambling restart using base-p digit reversal mapping (Monna map)
-                    let primes = [2, 3, 5, 7];
-                    let p = primes[step % primes.len()];
-
-                    let x_raan = raan0 / (2.0 * std::f64::consts::PI);
-                    let x_u = u0 / (2.0 * std::f64::consts::PI);
-
-                    let val_raan = inverse_monna_map(x_raan, p, 16);
-                    let val_u = inverse_monna_map(x_u, p, 16);
-
-                    let perturb_scale = 4;
-                    let perturbation = (rng.next_f64() * (p as f64).powi(perturb_scale)) as u64;
-                    let val_raan_perturbed = val_raan.wrapping_add(perturbation);
-                    let val_u_perturbed = val_u.wrapping_add(perturbation);
-
-                    let x_raan_scrambled = monna_map(val_raan_perturbed, p);
-                    let x_u_scrambled = monna_map(val_u_perturbed, p);
-
-                    let raan0_scrambled = (x_raan_scrambled * 2.0 * std::f64::consts::PI)
-                        .rem_euclid(2.0 * std::f64::consts::PI);
-                    let u0_scrambled = (x_u_scrambled * 2.0 * std::f64::consts::PI)
-                        .rem_euclid(2.0 * std::f64::consts::PI);
-
-                    let scrambled_rss = compute_rss(
-                        stage1_passes,
-                        rec_ecef,
-                        stage1_params[0],
-                        stage1_params[1],
-                        epoch,
-                        center_freq,
-                        raan0_scrambled,
-                        u0_scrambled,
-                    );
-                    let current_diffs = compute_fractional_difference_history(&rss_history);
-                    let current_var_sum: f64 = current_diffs.iter().map(|d| d.abs()).sum();
-                    let reg_rss_current = current_rss + 0.01 * current_var_sum;
-
-                    let mut temp_history = rss_history.clone();
-                    if let Some(last_elem) = temp_history.last_mut() {
-                        *last_elem = scrambled_rss;
-                    }
-                    let scrambled_diffs = compute_fractional_difference_history(&temp_history);
-                    let scrambled_var_sum: f64 = scrambled_diffs.iter().map(|d| d.abs()).sum();
-                    let reg_rss_scrambled = scrambled_rss + 0.01 * scrambled_var_sum;
-
-                    if reg_rss_scrambled < reg_rss_current {
-                        raan0 = raan0_scrambled;
-                        u0 = u0_scrambled;
-                        if let Some(last_elem) = rss_history.last_mut() {
-                            *last_elem = scrambled_rss;
-                        }
-                    }
-
-                    lr *= 0.95;
-                    noise_std *= 0.9;
-                }
-
-                let final_rss = compute_rss(
-                    stage1_passes,
-                    rec_ecef,
-                    stage1_params[0],
-                    stage1_params[1],
-                    epoch,
-                    center_freq,
-                    raan0,
-                    u0,
-                );
-                if final_rss < traj_best_rss {
-                    traj_best_rss = final_rss;
-                    traj_best_raan = raan0;
-                    traj_best_u = u0;
-                }
-
-                ((traj_best_raan, traj_best_u), traj_best_rss, rss_history)
+                        state[2],
+                        state[3],
+                    )
+                };
+                let initial_state = [start_a, initial_i, init_raan, init_u0];
+                let (best_state, best_rss) = opt.optimize(initial_state, &bounds, cost_fn, 15, &mut rng);
+                (best_state, best_rss)
             })
             .collect()
     });
 
-    let mut best_rss_history = Vec::new();
-    for ((traj_best_raan, traj_best_u), traj_best_rss, traj_history) in results {
-        if traj_best_rss < best_rss {
-            best_rss = traj_best_rss;
-            best_raan0 = traj_best_raan;
-            best_u0 = traj_best_u;
-            best_rss_history = traj_history;
-        }
-    }
+    let mut best_init_a_state = [initial_a, initial_i, 0.0, 0.0];
+    let mut best_init_a_rss = f64::MAX;
+    let mut best_a_est_state = [a_est, initial_i, 0.0, 0.0];
+    let mut best_a_est_rss = f64::MAX;
 
-    let rss_diffs = compute_fractional_difference_history(&best_rss_history);
-    if !rss_diffs.is_empty() {
-        println!(
-            "Langevin trajectory fractional variation sum: {:?}",
-            rss_diffs.iter().sum::<f64>()
-        );
+    for (state, rss) in results {
+        if (state[0] - initial_a).abs() < 1.0 {
+            if rss < best_init_a_rss {
+                best_init_a_rss = rss;
+                best_init_a_state = state;
+            }
+        } else {
+            if rss < best_a_est_rss {
+                best_a_est_rss = rss;
+                best_a_est_state = state;
+            }
+        }
     }
 
     println!(
-        "Langevin best: raan0={:.4} deg, u0={:.4} deg, rss={:.2e}",
-        best_raan0.to_degrees(),
-        best_u0.to_degrees(),
-        best_rss
+        "Adelic Langevin best init_a: a={:.1}m, i={:.4} deg, raan0={:.4} deg, u0={:.4} deg, rss={:.2e}",
+        best_init_a_state[0],
+        best_init_a_state[1].to_degrees(),
+        best_init_a_state[2].to_degrees(),
+        best_init_a_state[3].to_degrees(),
+        best_init_a_rss
     );
-    stage1_params[2] = best_raan0;
-    stage1_params[3] = best_u0;
-
-    // Initialize stage 1 pass-specific parameters
-    let stage1_pred_pcas = get_pred_pca_times(
-        stage1_params[0],
-        stage1_params[1],
-        stage1_params[2],
-        stage1_params[3],
-        epoch,
-        rec_ecef,
-        stage1_passes,
-    );
-    for (p_idx, pass) in stage1_passes.iter().enumerate() {
-        let mut obs_pca_time = pass.points[0].time;
-        let mut min_offset = f64::MAX;
-        for pt in &pass.points {
-            let off = (pt.freq - center_freq).abs();
-            if off < min_offset {
-                min_offset = off;
-                obs_pca_time = pt.time;
-            }
-        }
-        let pred_pca_time = stage1_pred_pcas[p_idx];
-        let dt = (pred_pca_time - obs_pca_time).num_milliseconds() as f64 / 1000.0;
-        stage1_params[4 + 2 * p_idx] = dt;
-        stage1_params[4 + 2 * p_idx + 1] = 0.0;
+    if best_a_est_rss < f64::MAX {
+        println!(
+            "Adelic Langevin best a_est: a={:.1}m, i={:.4} deg, raan0={:.4} deg, u0={:.4} deg, rss={:.2e}",
+            best_a_est_state[0],
+            best_a_est_state[1].to_degrees(),
+            best_a_est_state[2].to_degrees(),
+            best_a_est_state[3].to_degrees(),
+            best_a_est_rss
+        );
     }
 
-    // Run LM on Stage 1 (optimize a, i, raan0, u0 using only the first 2 passes)
-    let mut stage1_lambda = 1.0;
-    let mut best_stage1_rss = f64::MAX;
-    let mut best_stage1_params = stage1_params.clone();
+    let run_stage1_lm = |best_state: [f64; 4]| -> (Vec<f64>, f64) {
+        let mut stage1_params = vec![0.0; 4 + 2 * 2];
+        stage1_params[0] = best_state[0];
+        stage1_params[1] = best_state[1];
+        stage1_params[2] = best_state[2];
+        stage1_params[3] = best_state[3];
 
-    for _ in 0..100 {
-        let mut residuals = Vec::new();
+        let stage1_pred_pcas = get_pred_pca_times(
+            stage1_params[0],
+            stage1_params[1],
+            stage1_params[2],
+            stage1_params[3],
+            epoch,
+            rec_ecef,
+            stage1_passes,
+        );
         for (p_idx, pass) in stage1_passes.iter().enumerate() {
-            let dt = stage1_params[4 + 2 * p_idx];
-            let df = stage1_params[4 + 2 * p_idx + 1];
+            let mut obs_pca_time = pass.points[0].time;
+            let mut min_offset = f64::MAX;
             for pt in &pass.points {
-                let pred = predict_frequency(
-                    stage1_params[0],
-                    stage1_params[1],
-                    stage1_params[2],
-                    stage1_params[3],
-                    epoch,
-                    pt.time,
-                    dt,
-                    df,
-                    center_freq,
-                    rec_ecef,
-                );
-                residuals.push(pt.freq - (center_freq + pred));
+                let off = (pt.freq - center_freq).abs();
+                if off < min_offset {
+                    min_offset = off;
+                    obs_pca_time = pt.time;
+                }
             }
-        }
-        for p_idx in 0..stage1_passes.len() {
-            let dt = stage1_params[4 + 2 * p_idx];
-            residuals.push(dt * 10.0);
+            let pred_pca_time = stage1_pred_pcas[p_idx];
+            let dt = (pred_pca_time - obs_pca_time).num_milliseconds() as f64 / 1000.0;
+            stage1_params[4 + 2 * p_idx] = dt;
+            stage1_params[4 + 2 * p_idx + 1] = 0.0;
         }
 
-        let rss: f64 = residuals.iter().map(|r| r * r).sum();
-        if rss < best_stage1_rss {
-            best_stage1_rss = rss;
-            best_stage1_params = stage1_params.clone();
-            stage1_lambda /= 10.0;
-        } else {
-            stage1_params = best_stage1_params.clone();
-            stage1_lambda *= 10.0;
-            if stage1_lambda > 1e12 {
-                break;
-            }
-            residuals.clear();
+        let mut stage1_lambda = 1.0;
+        let mut best_stage1_rss = f64::MAX;
+        let mut best_stage1_params = stage1_params.clone();
+
+        for _ in 0..100 {
+            let mut residuals = Vec::new();
             for (p_idx, pass) in stage1_passes.iter().enumerate() {
                 let dt = stage1_params[4 + 2 * p_idx];
                 let df = stage1_params[4 + 2 * p_idx + 1];
@@ -750,91 +784,169 @@ pub fn fit_orbit_doppler(
                 let dt = stage1_params[4 + 2 * p_idx];
                 residuals.push(dt * 10.0);
             }
-        }
 
-        let n_obs = residuals.len();
-        if n_obs < 8 {
-            break;
-        }
-
-        let mut jacobian = vec![vec![0.0; 8]; n_obs];
-        for k in 0..8 {
-            let mut perturbed = stage1_params.clone();
-            let param_eps = if k == 0 {
-                10.0
-            } else if k == 1 || k == 2 || k == 3 {
-                1e-6
-            } else if (k - 4) % 2 == 0 {
-                1e-3
+            let rss: f64 = residuals.iter().map(|r| r * r).sum();
+            if rss < best_stage1_rss {
+                best_stage1_rss = rss;
+                best_stage1_params = stage1_params.clone();
+                stage1_lambda /= 10.0;
             } else {
-                1e-2
-            };
-            perturbed[k] += param_eps;
+                stage1_params = best_stage1_params.clone();
+                stage1_lambda *= 10.0;
+                if stage1_lambda > 1e12 {
+                    break;
+                }
+                residuals.clear();
+                for (p_idx, pass) in stage1_passes.iter().enumerate() {
+                    let dt = stage1_params[4 + 2 * p_idx];
+                    let df = stage1_params[4 + 2 * p_idx + 1];
+                    for pt in &pass.points {
+                        let pred = predict_frequency(
+                            stage1_params[0],
+                            stage1_params[1],
+                            stage1_params[2],
+                            stage1_params[3],
+                            epoch,
+                            pt.time,
+                            dt,
+                            df,
+                            center_freq,
+                            rec_ecef,
+                        );
+                        residuals.push(pt.freq - (center_freq + pred));
+                    }
+                }
+                for p_idx in 0..stage1_passes.len() {
+                    let dt = stage1_params[4 + 2 * p_idx];
+                    residuals.push(dt * 10.0);
+                }
+            }
 
-            let mut row_idx = 0;
-            for (p_idx, pass) in stage1_passes.iter().enumerate() {
-                let dt = perturbed[4 + 2 * p_idx];
-                let df = perturbed[4 + 2 * p_idx + 1];
-                for pt in &pass.points {
-                    let pred = predict_frequency(
-                        perturbed[0],
-                        perturbed[1],
-                        perturbed[2],
-                        perturbed[3],
-                        epoch,
-                        pt.time,
-                        dt,
-                        df,
-                        center_freq,
-                        rec_ecef,
-                    );
-                    let diff = pt.freq - (center_freq + pred);
+            let n_obs = residuals.len();
+            if n_obs < 8 {
+                break;
+            }
+
+            let mut jacobian = vec![vec![0.0; 8]; n_obs];
+            for k in 0..8 {
+                let mut perturbed = stage1_params.clone();
+                let param_eps = if k == 0 {
+                    10.0
+                } else if k == 1 || k == 2 || k == 3 {
+                    1e-6
+                } else if (k - 4) % 2 == 0 {
+                    1e-3
+                } else {
+                    1e-2
+                };
+                perturbed[k] += param_eps;
+
+                let mut row_idx = 0;
+                for (p_idx, pass) in stage1_passes.iter().enumerate() {
+                    let dt = perturbed[4 + 2 * p_idx];
+                    let df = perturbed[4 + 2 * p_idx + 1];
+                    for pt in &pass.points {
+                        let pred = predict_frequency(
+                            perturbed[0],
+                            perturbed[1],
+                            perturbed[2],
+                            perturbed[3],
+                            epoch,
+                            pt.time,
+                            dt,
+                            df,
+                            center_freq,
+                            rec_ecef,
+                        );
+                        let diff = pt.freq - (center_freq + pred);
+                        jacobian[row_idx][k] = (diff - residuals[row_idx]) / param_eps;
+                        row_idx += 1;
+                    }
+                }
+                for p_idx in 0..stage1_passes.len() {
+                    let dt = perturbed[4 + 2 * p_idx];
+                    let diff = dt * 10.0;
                     jacobian[row_idx][k] = (diff - residuals[row_idx]) / param_eps;
                     row_idx += 1;
                 }
             }
-            for p_idx in 0..stage1_passes.len() {
-                let dt = perturbed[4 + 2 * p_idx];
-                let diff = dt * 10.0;
-                jacobian[row_idx][k] = (diff - residuals[row_idx]) / param_eps;
-                row_idx += 1;
-            }
-        }
 
-        let mut jt_j = vec![vec![0.0; 8]; 8];
-        let mut jt_r = vec![0.0; 8];
-        for row in 0..n_obs {
-            for c1 in 0..8 {
-                jt_r[c1] += jacobian[row][c1] * residuals[row];
-                for c2 in 0..8 {
-                    jt_j[c1][c2] += jacobian[row][c1] * jacobian[row][c2];
+            let mut jt_j = vec![vec![0.0; 8]; 8];
+            let mut jt_r = vec![0.0; 8];
+            for row in 0..n_obs {
+                for c1 in 0..8 {
+                    jt_r[c1] += jacobian[row][c1] * residuals[row];
+                    for c2 in 0..8 {
+                        jt_j[c1][c2] += jacobian[row][c1] * jacobian[row][c2];
+                    }
                 }
             }
-        }
 
-        for k in 0..8 {
-            jt_j[k][k] += stage1_lambda * jt_j[k][k];
-        }
-
-        if let Some(delta) = solve_linear_system(&mut jt_j, &jt_r) {
             for k in 0..8 {
-                stage1_params[k] -= delta[k];
+                jt_j[k][k] += stage1_lambda * jt_j[k][k];
             }
-            stage1_params[0] = stage1_params[0].max(6500e3).min(20000e3);
-            stage1_params[1] = stage1_params[1].max(0.0).min(std::f64::consts::PI);
-            // Scale-aware convergence: check relative step size per parameter.
-            let max_rel_step = (0..8).map(|k| {
-                let denom = stage1_params[k].abs().max(1e-10);
-                delta[k].abs() / denom
-            }).fold(0.0f64, f64::max);
-            if max_rel_step < 1e-8 {
+
+            if let Some(delta) = solve_linear_system(&mut jt_j, &jt_r) {
+                for k in 0..8 {
+                    stage1_params[k] -= delta[k];
+                }
+                stage1_params[0] = stage1_params[0].max(6500e3).min(20000e3);
+                stage1_params[1] = stage1_params[1].max(0.0).min(std::f64::consts::PI);
+                let max_rel_step = (0..8).map(|k| {
+                    let denom = stage1_params[k].abs().max(1e-10);
+                    delta[k].abs() / denom
+                }).fold(0.0f64, f64::max);
+                if max_rel_step < 1e-8 {
+                    break;
+                }
+            } else {
                 break;
             }
-        } else {
-            break;
         }
-    }
-    stage1_params = best_stage1_params;
+        (best_stage1_params, best_stage1_rss)
+    };
+
+    let (stage1_params_init_a, _) = run_stage1_lm(best_init_a_state);
+    let (stage1_params, _) = if best_a_est_rss < f64::MAX {
+        let (stage1_params_a_est, _) = run_stage1_lm(best_a_est_state);
+        let rss_all_init_a = compute_rss(
+            raw_passes,
+            rec_ecef,
+            stage1_params_init_a[0],
+            stage1_params_init_a[1],
+            epoch,
+            center_freq,
+            stage1_params_init_a[2],
+            stage1_params_init_a[3],
+        );
+        let rss_all_a_est = compute_rss(
+            raw_passes,
+            rec_ecef,
+            stage1_params_a_est[0],
+            stage1_params_a_est[1],
+            epoch,
+            center_freq,
+            stage1_params_a_est[2],
+            stage1_params_a_est[3],
+        );
+        if rss_all_init_a < rss_all_a_est {
+            (stage1_params_init_a, rss_all_init_a)
+        } else {
+            (stage1_params_a_est, rss_all_a_est)
+        }
+    } else {
+        let rss_all_init_a = compute_rss(
+            raw_passes,
+            rec_ecef,
+            stage1_params_init_a[0],
+            stage1_params_init_a[1],
+            epoch,
+            center_freq,
+            stage1_params_init_a[2],
+            stage1_params_init_a[3],
+        );
+        (stage1_params_init_a, rss_all_init_a)
+    };
 
     // --- STAGE 2: Fit using all passes, initialized with Stage 1 refined parameters ---
     params[0] = stage1_params[0];
@@ -1383,6 +1495,7 @@ pub fn compute_rss(
         let dt = (pred_pca_time - obs_pca_time).num_milliseconds() as f64 / 1000.0;
         rss += 100.0 * dt * dt;
 
+        let mut diffs = Vec::with_capacity(pass.points.len());
         for pt in &pass.points {
             let pred_f = predict_frequency(
                 initial_a,
@@ -1396,8 +1509,16 @@ pub fn compute_rss(
                 center_freq,
                 rec_ecef,
             );
-            let diff = pt.freq - (center_freq + pred_f);
-            rss += diff * diff;
+            diffs.push(pt.freq - (center_freq + pred_f));
+        }
+        let mean_df = if !diffs.is_empty() {
+            diffs.iter().sum::<f64>() / diffs.len() as f64
+        } else {
+            0.0
+        };
+        for diff in diffs {
+            let residual = diff - mean_df;
+            rss += residual * residual;
         }
     }
     rss
