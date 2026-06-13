@@ -21,6 +21,7 @@
 - **LEO Doppler Tracking**: Actively tracks high-velocity Doppler frequency curves from LEO satellites passing overhead to compute relative motion.
 - **Multi-Channel Parallel Tracking**: Concurrently tracks up to 8 satellites in parallel, distributing digital downconversion (DDC) and decimation filters across a Rayon-backed thread pool for real-time operation.
 - **3-State Carrier PLL-EKF**: A sample-by-sample Extended Kalman Filter (PLL-EKF) that tracks carrier phase, frequency, and chirp-rate (frequency acceleration) to lock onto weak satellite downlink signals even in extreme noise.
+- **Dual-Frequency Tracking & Ionospheric Correction**: Tracks dual carrier frequencies using a coupled 6-state EKF to calculate real-time Total Electron Content (TEC) and eliminate first-order dispersive ionospheric propagation delays.
 - **Gardner Symbol Timing Recovery**: A feedback timing loop utilizing a Farrow parabolic interpolator and Proportional-Integral (PI) loop filter to achieve sub-sample symbol synchronization on PSK telemetry.
 - **Reverse-GPS Geodetic Solver**: A geodetic Gauss-Newton solver that computes the receiver's 3D coordinates on the WGS84 ellipsoid by fitting observed Doppler curves against known satellite orbits (TLEs).
 - **LEODO Clock Discipline**: A Low Earth Orbit Doppler Oscillometry EKF that measures local quartz oscillator phase and frequency drift, steering the host system clock to millisecond-level absolute accuracy via the `libc::adjtime` system call or by writing offsets to an NTP Shared Memory (SHM) segment via `--leodo-shm`.
@@ -77,6 +78,58 @@ LEO satellites transmit signals with specific polarizations (typically Right-Han
 
 ---
 
+## Dual-Frequency Tracking & Ionospheric Correction
+
+The ionosphere is a dispersive medium (refractive index varies with frequency) that induces frequency-dependent phase advances and group delays on satellite downlink signals. Standard single-frequency receivers are vulnerable to these ionospheric propagation errors, distorting the Doppler curve and introducing timing and positioning offsets.
+
+`sattime` implements a high-precision, real-time **Dual-Frequency Tracking** mode to cancel out first-order ionospheric effects and estimate the ionosphere's Total Electron Content (TEC).
+
+### 1. Coupled 6-State Extended Kalman Filter (CarrierPllEkf)
+When dual-frequency mode is activated via the `--frequency2` command-line option, the system spins up a joint 6-state state space tracking model. Instead of two independent filters, the EKF couples the dynamics of the primary and secondary signals.
+
+* **State Vector**:
+  $$\mathbf{x} = \begin{bmatrix} \theta_1 & \omega_1 & \alpha_1 & \theta_2 & \omega_2 & \alpha_2 \end{bmatrix}^T$$
+  where $\theta_i$ is the phase (rad), $\omega_i$ is the angular frequency (rad/s), and $\alpha_i$ is the angular chirp rate (rad/s$^2$) for carrier $i \in \{1, 2\}$.
+
+* **Transition Matrix ($F$)**:
+  $$F = \begin{bmatrix}
+  1 & \Delta t & \frac{1}{2}\Delta t^2 & 0 & 0 & 0 \\
+  0 & 1 & \Delta t & 0 & 0 & 0 \\
+  0 & 0 & 1 & 0 & 0 & 0 \\
+  0 & 0 & 0 & 1 & \Delta t & \frac{1}{2}\Delta t^2 \\
+  0 & 0 & 0 & 0 & 1 & \Delta t \\
+  0 & 0 & 0 & 0 & 0 & 1
+  \end{bmatrix}$$
+
+* **Coupled Process Noise Covariance ($Q$)**:
+  The dynamics are physically tied by the nominal frequency ratio $r = f_2 / f_1$. Process noise is coupled to prevent tracking divergence on either carrier:
+  $$Q = \begin{bmatrix}
+  q_p & 0 & 0 & 0 & 0 & 0 \\
+  0 & q_f & 0 & 0 & r q_f & 0 \\
+  0 & 0 & q_c & 0 & 0 & r q_c \\
+  0 & 0 & 0 & q_p & 0 & 0 \\
+  0 & r q_f & 0 & 0 & r^2 q_f & 0 \\
+  0 & 0 & r q_c & 0 & 0 & r^2 q_c
+  \end{bmatrix} \cdot s_m \Delta t$$
+  where $q_p, q_f, q_c$ are the phase, frequency, and chirp process noise parameters, and $s_m = 1.0 - 0.9 M_{\text{lock}}$ is the adaptive process noise scale. The cross-covariance terms ($r q_f$ and $r q_c$) force the frequency and chirp state covariance to evolve in lockstep, utilizing the stronger signal's energy to guide the tracker when one channel suffers a deep signal fade.
+
+### 2. Appleton-Hartree Dispersion Cancellation
+To recover the true geometric Doppler shift, the system applies the first-order Appleton-Hartree dispersion formula to combine the tracked absolute frequencies:
+$$f_{1,\text{abs}} = f_1 + \frac{\omega_1}{2\pi}, \quad f_{2,\text{abs}} = f_2 + \frac{\omega_2}{2\pi}$$
+The ionosphere-free carrier frequency $f_{\text{free}}$ is evaluated as:
+$$f_{\text{free}} = \frac{f_1^2 f_{1,\text{abs}} - f_2^2 f_{2,\text{abs}}}{f_1^2 - f_2^2}$$
+where $f_1$ and $f_2$ are the nominal carrier frequencies. This linear combination completely eliminates the $1/f^2$ dispersive ionospheric shift, producing clean Doppler data for orbit solving and system clock discipline.
+
+### 3. Total Electron Content (TEC) Calculation
+By comparing the carrier phase estimates $\theta_1$ and $\theta_2$ of the primary and secondary carriers, `sattime` extracts the line-of-sight Total Electron Content (TEC) in real time:
+$$\text{TEC (TECU)} = \left| 1.1839 \times 10^{-10} \cdot \left(\frac{f_1^2 f_2^2}{f_1^2 - f_2^2}\right) \cdot \left(\frac{\theta_1}{f_1} - \frac{\theta_2}{f_2}\right) \right|$$
+where $1 \text{ TECU} = 10^{16} \text{ electrons/m}^2$, and $\theta_1, \theta_2$ are the tracked carrier phases in radians.
+
+### 4. Interactive TUI Display
+When dual-frequency mode is active, the terminal dashboard renders real-time TEC measurements in the channel tracking table under the **TEC** column, formatted in units of `TECU`. If a channel is in single-frequency mode or is idle, it displays `---`.
+
+---
+
 ## Running Instructions
 
 ### First-Time Use & Observer Position Kickstart
@@ -104,6 +157,12 @@ cargo run --release -- --simulate --tle passes/starlink.tle --frequency 15080000
 Determine circular orbital parameters ($a, i, \Omega_0, u_0$) and pass-specific clock offsets from raw frequency measurement logs:
 ```bash
 cargo run --release -- --solve-orbit passes/pass_1.csv,passes/pass_2.csv
+```
+
+### 4. Dual-Frequency Live Mode
+Stream samples and track dual-frequency satellite downlinks (e.g. Starlink L1/L2 or other dual-frequency VHF signals) to cancel ionospheric delay and compute TEC:
+```bash
+cargo run --release -- --sdr "driver=rtlsdr" --frequency 150800000.0 --frequency2 150000000.0
 ```
 
 ---

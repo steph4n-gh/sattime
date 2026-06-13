@@ -14,6 +14,8 @@ pub struct LeodoLoop {
     pub synchronized: bool,
     pub pending_step_adjustment: Option<f64>,
     pub shm_unit: Option<usize>,
+    pub active_slew: f64,
+    pub consensus_engine: ConsensusSteeringEngine,
 }
 
 impl LeodoLoop {
@@ -28,6 +30,8 @@ impl LeodoLoop {
             synchronized: false,
             pending_step_adjustment: None,
             shm_unit: None,
+            active_slew: 0.0,
+            consensus_engine: ConsensusSteeringEngine::new(),
         }
     }
 }
@@ -169,7 +173,7 @@ fn write_to_ntp_shm(shm_unit: usize, target_adjustment: f64) -> Result<(), Strin
 #[cfg(target_family = "unix")]
 pub fn steer_system_clock(
     offset_seconds: f64,
-    lo_bias: f64,
+    _lo_bias: f64,
     center_freq: f64,
     log_path: &str,
     enable_steering: bool,
@@ -178,8 +182,22 @@ pub fn steer_system_clock(
     let now = chrono::Utc::now();
     let mut msgs: Vec<String> = Vec::new();
 
-    // Calculate frequency error in PPM
-    let freq_err_ppm = (lo_bias / center_freq) * 1_000_000.0;
+    let mut completed_slew = 0.0;
+    if enable_steering && leodo_loop.shm_unit.is_none() {
+        let mut old_delta = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let ret = unsafe { libc::adjtime(std::ptr::null(), &mut old_delta) };
+        if ret == 0 {
+            let remaining_slew = old_delta.tv_sec as f64 + old_delta.tv_usec as f64 * 1e-6;
+            completed_slew = leodo_loop.active_slew - remaining_slew;
+            leodo_loop.active_slew = remaining_slew;
+        }
+    }
+
+    // Apply control feedback portion of the slew to EKF state BEFORE predict/update
+    leodo_loop.clock_ekf.x[0] -= completed_slew;
 
     // Update EKF & PI loop
     let dt = if let Some(last) = leodo_loop.last_update {
@@ -191,7 +209,7 @@ pub fn steer_system_clock(
     if dt > 0.0 {
         leodo_loop.clock_ekf.predict(dt);
     }
-    leodo_loop.clock_ekf.update(offset_seconds, freq_err_ppm);
+    leodo_loop.clock_ekf.update_1d(offset_seconds);
 
     // Compute the target adjustment from the EKF phase offset
     let target_adjustment = leodo_loop.clock_ekf.x[0];
@@ -210,6 +228,7 @@ pub fn steer_system_clock(
                     ));
                     leodo_loop.synchronized = true;
                     leodo_loop.last_update = Some(now);
+                    leodo_loop.active_slew = 0.0;
                 }
                 Err(err) => {
                     status_str = format!("ERROR_SHM: {}", err);
@@ -217,6 +236,7 @@ pub fn steer_system_clock(
                         "[LEODO] Failed to write to NTP SHM segment NTP{}: {}",
                         shm_unit, err
                     ));
+                    leodo_loop.active_slew = 0.0;
                 }
             }
         } else if !leodo_loop.synchronized && target_adjustment.abs() > 0.1 {
@@ -235,6 +255,7 @@ pub fn steer_system_clock(
                         "[LEODO] Successfully stepped system clock by {:.6}s",
                         target_adjustment
                     ));
+                    leodo_loop.active_slew = 0.0;
                 }
                 Err(err) => {
                     leodo_loop.synchronized = true; // Lock stepping even if it failed/EPERM so subsequent steering uses slewing
@@ -257,6 +278,7 @@ pub fn steer_system_clock(
                         status_str = format!("ERROR_STEP: {}", err);
                         msgs.push(format!("[LEODO] Clock stepping failed: {}", err));
                     }
+                    leodo_loop.active_slew = 0.0;
                 }
             }
         } else {
@@ -281,7 +303,7 @@ pub fn steer_system_clock(
             // unsafe block to call the native OS API
             let ret = unsafe { libc::adjtime(&delta, &mut old_delta) };
             if ret == 0 {
-                actual_slewed = target_adjustment; // Slew will be completed by the next sparse EKF pass update, feeding back the control input
+                leodo_loop.active_slew = target_adjustment; // Slew will be completed by the next sparse EKF pass update, feeding back the control input
                 status_str = format!("SUCCESS_SLEW (target {:.6}s)", target_adjustment);
                 msgs.push(format!(
                     "[LEODO] Successfully requested OS clock slew of {:.6}s",
@@ -308,6 +330,7 @@ pub fn steer_system_clock(
                     status_str = format!("ERROR_SLEW: {}", err);
                     msgs.push(format!("[LEODO] Clock slewing failed: {}", err));
                 }
+                leodo_loop.active_slew = 0.0;
             }
         }
     } else {
@@ -327,9 +350,10 @@ pub fn steer_system_clock(
 
         leodo_loop.synchronized = true;
         leodo_loop.last_update = Some(now);
+        leodo_loop.active_slew = 0.0;
     }
 
-    // Apply control feedback step correction to EKF phase state
+    // Apply control feedback step/immediate correction to EKF phase state
     leodo_loop.clock_ekf.x[0] -= actual_slewed;
 
     leodo_loop.last_offset = offset_seconds;
@@ -364,8 +388,8 @@ pub fn steer_system_clock(
 #[cfg(not(target_family = "unix"))]
 pub fn steer_system_clock(
     offset_seconds: f64,
-    lo_bias: f64,
-    center_freq: f64,
+    _lo_bias: f64,
+    _center_freq: f64,
     log_path: &str,
     enable_steering: bool,
     leodo_loop: &mut LeodoLoop,
@@ -378,12 +402,10 @@ pub fn steer_system_clock(
     };
     leodo_loop.last_update = Some(now);
 
-    let freq_err_ppm = (lo_bias / center_freq) * 1_000_000.0;
-
     if dt > 0.0 {
         leodo_loop.clock_ekf.predict(dt);
     }
-    leodo_loop.clock_ekf.update(offset_seconds, freq_err_ppm);
+    leodo_loop.clock_ekf.update_1d(offset_seconds);
 
     let target_adjustment = leodo_loop.clock_ekf.x[0];
     leodo_loop.synchronized = true;

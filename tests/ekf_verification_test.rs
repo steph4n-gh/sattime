@@ -74,7 +74,7 @@ fn test_adaptive_ekf_process_noise_fixed() {
     tracker_fixed.adaptive_ekf = false;
     tracker_fixed.reset(0.0, 20.0, 0.0);
 
-    tracker_fixed.p = nalgebra::Matrix3::zeros();
+    tracker_fixed.p = nalgebra::Matrix6::zeros();
 
     tracker_fixed.lock_metric = 0.1;
     tracker_fixed.predict();
@@ -82,7 +82,7 @@ fn test_adaptive_ekf_process_noise_fixed() {
     let q_freq_1 = tracker_fixed.p[(1, 1)];
     let q_chirp_1 = tracker_fixed.p[(2, 2)];
 
-    tracker_fixed.p = nalgebra::Matrix3::zeros();
+    tracker_fixed.p = nalgebra::Matrix6::zeros();
     tracker_fixed.lock_metric = 0.9;
     tracker_fixed.predict();
     let q_phase_2 = tracker_fixed.p[(0, 0)];
@@ -106,12 +106,12 @@ fn test_adaptive_ekf_process_noise_fixed() {
     tracker_adaptive.adaptive_ekf = true;
     tracker_adaptive.reset(0.0, 20.0, 0.0);
 
-    tracker_adaptive.p = nalgebra::Matrix3::zeros();
+    tracker_adaptive.p = nalgebra::Matrix6::zeros();
     tracker_adaptive.lock_metric = 0.1;
     tracker_adaptive.predict();
     let q_phase_adaptive_1 = tracker_adaptive.p[(0, 0)];
 
-    tracker_adaptive.p = nalgebra::Matrix3::zeros();
+    tracker_adaptive.p = nalgebra::Matrix6::zeros();
     tracker_adaptive.lock_metric = 0.9;
     tracker_adaptive.predict();
     let q_phase_adaptive_2 = tracker_adaptive.p[(0, 0)];
@@ -363,7 +363,7 @@ fn test_bpsk_squaring_low_snr() {
     
     // Reset near twice the Doppler shift
     tracker.reset(0.0, 2.0 * target_freq, 0.0);
-    tracker.p = nalgebra::Matrix3::zeros();
+    tracker.p = nalgebra::Matrix6::zeros();
     tracker.p[(0, 0)] = 1e-4;
     tracker.p[(1, 1)] = 1e-4;
     tracker.p[(2, 2)] = 1e-6;

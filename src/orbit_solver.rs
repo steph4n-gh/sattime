@@ -108,7 +108,7 @@ pub fn propagate_ecef_at_time(
     t_orbit: DateTime<Utc>,
     t_rotate: DateTime<Utc>,
 ) -> ([f64; 3], [f64; 3]) {
-    let tau = (t_orbit - epoch).num_milliseconds() as f64 / 1000.0;
+    let tau = (t_orbit - epoch).num_microseconds().unwrap_or(0) as f64 / 1_000_000.0;
 
     let n = (MU / a.powi(3)).sqrt();
     let v = (MU / a).sqrt();
@@ -270,8 +270,15 @@ pub fn predict_frequency(
     center_freq: f64,
     rec_ecef: [f64; 3],
 ) -> f64 {
-    let t_adj = t_obs + chrono::Duration::milliseconds((dt * 1000.0) as i64);
-    let (pos_sat, vel_sat) = propagate_ecef_at_time(a, i, raan0, u0, epoch, t_adj, t_obs);
+    let t_adj = t_obs + chrono::Duration::microseconds((dt * 1_000_000.0) as i64);
+    
+    // Estimate initial position/velocity for eccentricity correction
+    let (pos_init, vel_init) = propagate_ecef_at_time(a, i, raan0, u0, epoch, t_adj, t_obs);
+    let r_dot_v = pos_init[0] * vel_init[0] + pos_init[1] * vel_init[1] + pos_init[2] * vel_init[2];
+    let dt_rel = -2.0 * r_dot_v / (C * C);
+    
+    let t_corr = t_adj + chrono::Duration::nanoseconds((dt_rel * 1e9) as i64);
+    let (pos_sat, vel_sat) = propagate_ecef_at_time(a, i, raan0, u0, epoch, t_corr, t_obs);
 
     let dx = pos_sat[0] - rec_ecef[0];
     let dy = pos_sat[1] - rec_ecef[1];
@@ -282,10 +289,21 @@ pub fn predict_frequency(
         return center_freq + df;
     }
 
-    let range_rate = (dx * vel_sat[0] + dy * vel_sat[1] + dz * vel_sat[2]) / dist;
-    let doppler_factor = 1.0 - range_rate / C;
+    let v_sat_sq = vel_sat[0] * vel_sat[0] + vel_sat[1] * vel_sat[1] + vel_sat[2] * vel_sat[2];
+    let r_sat = (pos_sat[0] * pos_sat[0] + pos_sat[1] * pos_sat[1] + pos_sat[2] * pos_sat[2]).sqrt();
+    let r_rec = (rec_ecef[0] * rec_ecef[0] + rec_ecef[1] * rec_ecef[1] + rec_ecef[2] * rec_ecef[2]).sqrt();
 
-    center_freq * doppler_factor - center_freq + df
+    let u_sat = -MU / r_sat;
+    let u_rec = -MU / r_rec;
+
+    let v_dot_n = (vel_sat[0] * dx + vel_sat[1] * dy + vel_sat[2] * dz) / dist;
+
+    let gamma_inv = (1.0 - v_sat_sq / (C * C)).sqrt();
+    let denominator = 1.0 - v_dot_n / C;
+    let potential_term = 1.0 + (u_sat - u_rec) / (C * C);
+
+    let f_obs = center_freq * (gamma_inv / denominator) * potential_term;
+    f_obs - center_freq + df
 }
 
 pub fn predict_frequency_poly(
@@ -301,20 +319,42 @@ pub fn predict_frequency_poly(
     center_freq: f64,
     rec_ecef: [f64; 3],
 ) -> f64 {
-    let t_adj = t_obs + chrono::Duration::milliseconds((dt * 1000.0) as i64);
-    let (pos_sat, vel_sat) = propagate_ecef_at_time(a, i, raan0, u0, epoch, t_adj, t_obs);
+    let t_adj = t_obs + chrono::Duration::microseconds((dt * 1_000_000.0) as i64);
+    
+    // Estimate initial position/velocity for eccentricity correction
+    let (pos_init, vel_init) = propagate_ecef_at_time(a, i, raan0, u0, epoch, t_adj, t_obs);
+    let r_dot_v = pos_init[0] * vel_init[0] + pos_init[1] * vel_init[1] + pos_init[2] * vel_init[2];
+    let dt_rel = -2.0 * r_dot_v / (C * C);
+    
+    let t_corr = t_adj + chrono::Duration::nanoseconds((dt_rel * 1e9) as i64);
+    let (pos_sat, vel_sat) = propagate_ecef_at_time(a, i, raan0, u0, epoch, t_corr, t_obs);
+
     let dx = pos_sat[0] - rec_ecef[0];
     let dy = pos_sat[1] - rec_ecef[1];
     let dz = pos_sat[2] - rec_ecef[2];
     let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+
     if dist < 1.0 {
         return center_freq + df_poly.0;
     }
-    let range_rate = (dx * vel_sat[0] + dy * vel_sat[1] + dz * vel_sat[2]) / dist;
-    let doppler_factor = 1.0 - range_rate / C;
+
+    let v_sat_sq = vel_sat[0] * vel_sat[0] + vel_sat[1] * vel_sat[1] + vel_sat[2] * vel_sat[2];
+    let r_sat = (pos_sat[0] * pos_sat[0] + pos_sat[1] * pos_sat[1] + pos_sat[2] * pos_sat[2]).sqrt();
+    let r_rec = (rec_ecef[0] * rec_ecef[0] + rec_ecef[1] * rec_ecef[1] + rec_ecef[2] * rec_ecef[2]).sqrt();
+
+    let u_sat = -MU / r_sat;
+    let u_rec = -MU / r_rec;
+
+    let v_dot_n = (vel_sat[0] * dx + vel_sat[1] * dy + vel_sat[2] * dz) / dist;
+
+    let gamma_inv = (1.0 - v_sat_sq / (C * C)).sqrt();
+    let denominator = 1.0 - v_dot_n / C;
+    let potential_term = 1.0 + (u_sat - u_rec) / (C * C);
+
+    let f_obs = center_freq * (gamma_inv / denominator) * potential_term;
     let tau = (t_obs - t_ref).num_milliseconds() as f64 / 1000.0;
     let bias = df_poly.0 + df_poly.1 * tau + df_poly.2 * tau * tau;
-    center_freq * doppler_factor - center_freq + bias
+    f_obs - center_freq + bias
 }
 
 
@@ -439,24 +479,138 @@ pub fn fit_orbit_doppler(
         }
     }
 
-    let results: Vec<((f64, f64), f64, Vec<f64>)> = starts
-        .into_par_iter()
-        .map(|(init_raan, init_u0, seed_state)| {
-            let mut raan0 = init_raan;
-            let mut u0 = init_u0;
-            let mut traj_best_raan = raan0;
-            let mut traj_best_u = u0;
-            let mut traj_best_rss = f64::MAX;
+    let num_threads = (rayon::current_num_threads() - 2).max(1);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build()
+        .unwrap();
 
-            let mut rng = SimpleRng { state: seed_state };
+    let results: Vec<((f64, f64), f64, Vec<f64>)> = pool.install(|| {
+        starts
+            .into_par_iter()
+            .map(|(init_raan, init_u0, seed_state)| {
+                let mut raan0 = init_raan;
+                let mut u0 = init_u0;
+                let mut traj_best_raan = raan0;
+                let mut traj_best_u = u0;
+                let mut traj_best_rss = f64::MAX;
 
-            let mut lr = 0.1;
-            let mut noise_std = 0.05;
+                let mut rng = SimpleRng { state: seed_state };
 
-            let mut rss_history = Vec::new();
+                let mut lr = 0.1;
+                let mut noise_std = 0.05;
 
-            for step in 0..15 {
-                let current_rss = compute_rss(
+                let mut rss_history = Vec::new();
+
+                for step in 0..15 {
+                    let current_rss = compute_rss(
+                        stage1_passes,
+                        rec_ecef,
+                        stage1_params[0],
+                        stage1_params[1],
+                        epoch,
+                        center_freq,
+                        raan0,
+                        u0,
+                    );
+                    rss_history.push(current_rss);
+                    if current_rss < traj_best_rss {
+                        traj_best_rss = current_rss;
+                        traj_best_raan = raan0;
+                        traj_best_u = u0;
+                    }
+
+                    // Compute gradient
+                    let (_, _, grad_raan, grad_u0) = compute_gradient(
+                        stage1_passes,
+                        rec_ecef,
+                        stage1_params[0],
+                        stage1_params[1],
+                        epoch,
+                        center_freq,
+                        raan0,
+                        u0,
+                    );
+
+                    let sign_raan = if grad_raan.is_nan() {
+                        0.0
+                    } else {
+                        grad_raan.signum()
+                    };
+                    let sign_u0 = if grad_u0.is_nan() {
+                        0.0
+                    } else {
+                        grad_u0.signum()
+                    };
+
+                    // Update directions
+                    let step_raan = -lr * sign_raan * 0.2 + noise_std * rng.next_gaussian() * 0.05;
+                    let step_u0 = -lr * sign_u0 * 0.2 + noise_std * rng.next_gaussian() * 0.05;
+
+                    let next_raan0 = (raan0 + step_raan).rem_euclid(2.0 * std::f64::consts::PI);
+                    let next_u0 = (u0 + step_u0).rem_euclid(2.0 * std::f64::consts::PI);
+
+                    raan0 = next_raan0;
+                    u0 = next_u0;
+
+                    // Digit-scrambling restart using base-p digit reversal mapping (Monna map)
+                    let primes = [2, 3, 5, 7];
+                    let p = primes[step % primes.len()];
+
+                    let x_raan = raan0 / (2.0 * std::f64::consts::PI);
+                    let x_u = u0 / (2.0 * std::f64::consts::PI);
+
+                    let val_raan = inverse_monna_map(x_raan, p, 16);
+                    let val_u = inverse_monna_map(x_u, p, 16);
+
+                    let perturb_scale = 4;
+                    let perturbation = (rng.next_f64() * (p as f64).powi(perturb_scale)) as u64;
+                    let val_raan_perturbed = val_raan.wrapping_add(perturbation);
+                    let val_u_perturbed = val_u.wrapping_add(perturbation);
+
+                    let x_raan_scrambled = monna_map(val_raan_perturbed, p);
+                    let x_u_scrambled = monna_map(val_u_perturbed, p);
+
+                    let raan0_scrambled = (x_raan_scrambled * 2.0 * std::f64::consts::PI)
+                        .rem_euclid(2.0 * std::f64::consts::PI);
+                    let u0_scrambled = (x_u_scrambled * 2.0 * std::f64::consts::PI)
+                        .rem_euclid(2.0 * std::f64::consts::PI);
+
+                    let scrambled_rss = compute_rss(
+                        stage1_passes,
+                        rec_ecef,
+                        stage1_params[0],
+                        stage1_params[1],
+                        epoch,
+                        center_freq,
+                        raan0_scrambled,
+                        u0_scrambled,
+                    );
+                    let current_diffs = compute_fractional_difference_history(&rss_history);
+                    let current_var_sum: f64 = current_diffs.iter().map(|d| d.abs()).sum();
+                    let reg_rss_current = current_rss + 0.01 * current_var_sum;
+
+                    let mut temp_history = rss_history.clone();
+                    if let Some(last_elem) = temp_history.last_mut() {
+                        *last_elem = scrambled_rss;
+                    }
+                    let scrambled_diffs = compute_fractional_difference_history(&temp_history);
+                    let scrambled_var_sum: f64 = scrambled_diffs.iter().map(|d| d.abs()).sum();
+                    let reg_rss_scrambled = scrambled_rss + 0.01 * scrambled_var_sum;
+
+                    if reg_rss_scrambled < reg_rss_current {
+                        raan0 = raan0_scrambled;
+                        u0 = u0_scrambled;
+                        if let Some(last_elem) = rss_history.last_mut() {
+                            *last_elem = scrambled_rss;
+                        }
+                    }
+
+                    lr *= 0.95;
+                    noise_std *= 0.9;
+                }
+
+                let final_rss = compute_rss(
                     stage1_passes,
                     rec_ecef,
                     stage1_params[0],
@@ -466,122 +620,16 @@ pub fn fit_orbit_doppler(
                     raan0,
                     u0,
                 );
-                rss_history.push(current_rss);
-                if current_rss < traj_best_rss {
-                    traj_best_rss = current_rss;
+                if final_rss < traj_best_rss {
+                    traj_best_rss = final_rss;
                     traj_best_raan = raan0;
                     traj_best_u = u0;
                 }
 
-                // Compute gradient
-                let (_, _, grad_raan, grad_u0) = compute_gradient(
-                    stage1_passes,
-                    rec_ecef,
-                    stage1_params[0],
-                    stage1_params[1],
-                    epoch,
-                    center_freq,
-                    raan0,
-                    u0,
-                );
-
-                let sign_raan = if grad_raan.is_nan() {
-                    0.0
-                } else {
-                    grad_raan.signum()
-                };
-                let sign_u0 = if grad_u0.is_nan() {
-                    0.0
-                } else {
-                    grad_u0.signum()
-                };
-
-                // Update directions
-                let step_raan = -lr * sign_raan * 0.2 + noise_std * rng.next_gaussian() * 0.05;
-                let step_u0 = -lr * sign_u0 * 0.2 + noise_std * rng.next_gaussian() * 0.05;
-
-                let next_raan0 = (raan0 + step_raan).rem_euclid(2.0 * std::f64::consts::PI);
-                let next_u0 = (u0 + step_u0).rem_euclid(2.0 * std::f64::consts::PI);
-
-                raan0 = next_raan0;
-                u0 = next_u0;
-
-                // Digit-scrambling restart using base-p digit reversal mapping (Monna map)
-                let primes = [2, 3, 5, 7];
-                let p = primes[step % primes.len()];
-
-                let x_raan = raan0 / (2.0 * std::f64::consts::PI);
-                let x_u = u0 / (2.0 * std::f64::consts::PI);
-
-                let val_raan = inverse_monna_map(x_raan, p, 16);
-                let val_u = inverse_monna_map(x_u, p, 16);
-
-                let perturb_scale = 4;
-                let perturbation = (rng.next_f64() * (p as f64).powi(perturb_scale)) as u64;
-                let val_raan_perturbed = val_raan.wrapping_add(perturbation);
-                let val_u_perturbed = val_u.wrapping_add(perturbation);
-
-                let x_raan_scrambled = monna_map(val_raan_perturbed, p);
-                let x_u_scrambled = monna_map(val_u_perturbed, p);
-
-                let raan0_scrambled = (x_raan_scrambled * 2.0 * std::f64::consts::PI)
-                    .rem_euclid(2.0 * std::f64::consts::PI);
-                let u0_scrambled = (x_u_scrambled * 2.0 * std::f64::consts::PI)
-                    .rem_euclid(2.0 * std::f64::consts::PI);
-
-                let scrambled_rss = compute_rss(
-                    stage1_passes,
-                    rec_ecef,
-                    stage1_params[0],
-                    stage1_params[1],
-                    epoch,
-                    center_freq,
-                    raan0_scrambled,
-                    u0_scrambled,
-                );
-                let current_diffs = compute_fractional_difference_history(&rss_history);
-                let current_var_sum: f64 = current_diffs.iter().map(|d| d.abs()).sum();
-                let reg_rss_current = current_rss + 0.01 * current_var_sum;
-
-                let mut temp_history = rss_history.clone();
-                if let Some(last_elem) = temp_history.last_mut() {
-                    *last_elem = scrambled_rss;
-                }
-                let scrambled_diffs = compute_fractional_difference_history(&temp_history);
-                let scrambled_var_sum: f64 = scrambled_diffs.iter().map(|d| d.abs()).sum();
-                let reg_rss_scrambled = scrambled_rss + 0.01 * scrambled_var_sum;
-
-                if reg_rss_scrambled < reg_rss_current {
-                    raan0 = raan0_scrambled;
-                    u0 = u0_scrambled;
-                    if let Some(last_elem) = rss_history.last_mut() {
-                        *last_elem = scrambled_rss;
-                    }
-                }
-
-                lr *= 0.95;
-                noise_std *= 0.9;
-            }
-
-            let final_rss = compute_rss(
-                stage1_passes,
-                rec_ecef,
-                stage1_params[0],
-                stage1_params[1],
-                epoch,
-                center_freq,
-                raan0,
-                u0,
-            );
-            if final_rss < traj_best_rss {
-                traj_best_rss = final_rss;
-                traj_best_raan = raan0;
-                traj_best_u = u0;
-            }
-
-            ((traj_best_raan, traj_best_u), traj_best_rss, rss_history)
-        })
-        .collect();
+                ((traj_best_raan, traj_best_u), traj_best_rss, rss_history)
+            })
+            .collect()
+    });
 
     let mut best_rss_history = Vec::new();
     for ((traj_best_raan, traj_best_u), traj_best_rss, traj_history) in results {

@@ -1,5 +1,5 @@
 use crate::dsp::*;
-use nalgebra::{Matrix1, Matrix2, Vector2};
+use nalgebra::{Matrix2, Vector2};
 use num_complex::Complex;
 use std::collections::VecDeque;
 
@@ -19,7 +19,7 @@ impl ClockEkf {
             p: Matrix2::new(1e-4, 0.0, 0.0, 1e-2), // 10ms phase variance, 0.1 PPM freq variance
             q_phase: 1e-12,                        // phase noise (s^2 / s)
             q_freq: 1e-14,                         // frequency walk noise (PPM^2 / s)
-            r_meas: 1e-8,                          // measurement noise (s^2)
+            r_meas: 1e-10,                         // measurement noise (s^2), optimized for microsecond-level fits
             r_freq: 1e-4,
         }
     }
@@ -37,6 +37,23 @@ impl ClockEkf {
         self.p = f * self.p * f.transpose() + q;
     }
 
+    pub fn update_1d(&mut self, z_offset: f64) {
+        let y = z_offset - self.x[0];
+        let s = self.p[(0, 0)] + self.r_meas;
+        if s.abs() >= 1e-12 {
+            let k = self.p.column(0) / s;
+            self.x += k * y;
+            let k0 = k[0];
+            let k1 = k[1];
+            let a = Matrix2::new(1.0 - k0, 0.0, -k1, 1.0);
+            self.p = a * self.p * a.transpose();
+            self.p[(0, 0)] += k0 * k0 * self.r_meas;
+            self.p[(0, 1)] += k0 * k1 * self.r_meas;
+            self.p[(1, 0)] += k1 * k0 * self.r_meas;
+            self.p[(1, 1)] += k1 * k1 * self.r_meas;
+        }
+    }
+
     pub fn update(&mut self, z_offset: f64, z_freq_ppm: f64) {
         let z = Vector2::new(z_offset, z_freq_ppm);
         let y = z - self.x;
@@ -52,12 +69,12 @@ impl ClockEkf {
     }
 }
 
-use nalgebra::{Matrix3, RowVector3, Vector3};
+use nalgebra::{Matrix6, Vector6};
 
 #[derive(Clone)]
 pub struct CarrierPllEkf {
-    pub x: Vector3<f64>, // [phase (rad), freq (rad/s), chirp_rate (rad/s^2)]
-    pub p: Matrix3<f64>, // error covariance matrix
+    pub x: Vector6<f64>, // [phase1, freq1, chirp1, phase2, freq2, chirp2]
+    pub p: Matrix6<f64>, // error covariance matrix
     pub q_phase: f64,
     pub q_freq: f64,
     pub q_chirp: f64,
@@ -73,17 +90,21 @@ pub struct CarrierPllEkf {
     pub pr_sum_abs_i: f64,
     pub pr_sum_q_sq: f64,
     pub convergence_guard: usize, // Samples remaining before lock_metric can trigger unlock
+    pub frequency_ratio: f64,
 }
 
 impl CarrierPllEkf {
     pub fn new(fs: f64, modulation: Modulation) -> Self {
-        let mut p = Matrix3::zeros();
+        let mut p = Matrix6::zeros();
         p[(0, 0)] = 1.0;
         p[(1, 1)] = (2.0 * std::f64::consts::PI * 100.0).powi(2);
         p[(2, 2)] = (2.0 * std::f64::consts::PI * 50.0).powi(2);
+        p[(3, 3)] = 1.0;
+        p[(4, 4)] = (2.0 * std::f64::consts::PI * 100.0).powi(2);
+        p[(5, 5)] = (2.0 * std::f64::consts::PI * 50.0).powi(2);
 
         Self {
-            x: Vector3::zeros(),
+            x: Vector6::zeros(),
             p,
             q_phase: 1e-1,
             q_freq: 5e3,
@@ -100,20 +121,32 @@ impl CarrierPllEkf {
             pr_sum_abs_i: 0.0,
             pr_sum_q_sq: 0.0,
             convergence_guard: 0,
+            frequency_ratio: 1.0,
         }
     }
 
+    pub fn set_frequency_ratio(&mut self, ratio: f64) {
+        self.frequency_ratio = ratio;
+    }
+
     pub fn reset(&mut self, initial_phase: f64, initial_freq_hz: f64, initial_chirp_hz_s: f64) {
-        self.x = Vector3::new(
+        let r = self.frequency_ratio;
+        self.x = Vector6::new(
             initial_phase,
             2.0 * std::f64::consts::PI * initial_freq_hz,
             2.0 * std::f64::consts::PI * initial_chirp_hz_s,
+            initial_phase,
+            2.0 * std::f64::consts::PI * initial_freq_hz * r,
+            2.0 * std::f64::consts::PI * initial_chirp_hz_s * r,
         );
 
-        self.p = Matrix3::zeros();
+        self.p = Matrix6::zeros();
         self.p[(0, 0)] = 1.0;
         self.p[(1, 1)] = (2.0 * std::f64::consts::PI * 100.0).powi(2);
         self.p[(2, 2)] = (2.0 * std::f64::consts::PI * 50.0).powi(2);
+        self.p[(3, 3)] = 1.0;
+        self.p[(4, 4)] = (2.0 * std::f64::consts::PI * 100.0).powi(2);
+        self.p[(5, 5)] = (2.0 * std::f64::consts::PI * 50.0).powi(2);
 
         self.lock_metric = 0.5;
         self.is_locked = true;
@@ -129,15 +162,15 @@ impl CarrierPllEkf {
         let dt = self.ts;
         let dt2 = 0.5 * dt * dt;
 
-        let f = Matrix3::new(1.0, dt, dt2, 0.0, 1.0, dt, 0.0, 0.0, 1.0);
+        let mut f = Matrix6::identity();
+        f[(0, 1)] = dt;
+        f[(0, 2)] = dt2;
+        f[(1, 2)] = dt;
+        f[(3, 4)] = dt;
+        f[(3, 5)] = dt2;
+        f[(4, 5)] = dt;
 
         self.x = f * self.x;
-
-        let (limit, half_limit) = match self.modulation {
-            Modulation::Carrier | Modulation::Bpsk => (2.0 * std::f64::consts::PI, std::f64::consts::PI),
-            Modulation::Qpsk => (std::f64::consts::PI / 2.0, std::f64::consts::PI / 4.0),
-        };
-        self.x[0] = (self.x[0] + half_limit).rem_euclid(limit) - half_limit;
 
         let s_m = if self.adaptive_ekf {
             1.0 - 0.9 * self.lock_metric.clamp(0.0, 1.0)
@@ -145,17 +178,29 @@ impl CarrierPllEkf {
             1.0
         };
 
-        let q = Matrix3::new(
-            self.q_phase * s_m * dt,
-            0.0,
-            0.0,
-            0.0,
-            self.q_freq * s_m * dt,
-            0.0,
-            0.0,
-            0.0,
-            self.q_chirp * s_m * dt,
-        );
+        let mut q = Matrix6::zeros();
+        let q_p = self.q_phase * s_m * dt;
+        let q_f = self.q_freq * s_m * dt;
+        let q_c = self.q_chirp * s_m * dt;
+
+        q[(0, 0)] = q_p;
+        q[(1, 1)] = q_f;
+        q[(2, 2)] = q_c;
+        q[(3, 3)] = q_p;
+
+        if (self.frequency_ratio - 1.0).abs() < 1e-6 {
+            q[(4, 4)] = q_f;
+            q[(5, 5)] = q_c;
+        } else {
+            let r = self.frequency_ratio;
+            q[(4, 4)] = q_f * r * r;
+            q[(5, 5)] = q_c * r * r;
+            // Coupled process noise terms
+            q[(1, 4)] = q_f * r;
+            q[(4, 1)] = q_f * r;
+            q[(2, 5)] = q_c * r;
+            q[(5, 2)] = q_c * r;
+        }
 
         self.p = f * self.p * f.transpose() + q;
 
@@ -163,16 +208,13 @@ impl CarrierPllEkf {
         self.p = (self.p + self.p.transpose()) * 0.5;
     }
 
-    pub fn update(&mut self, sample: Complex<f32>) {
-        // BPSK squaring: s² removes ±1 data modulation but doubles the carrier
-        // frequency. The EKF therefore tracks at 2× the true carrier frequency.
-        // All readout points divide by `scale = 2.0` to recover the true frequency.
-        // See dsp.rs process_block_with_center() and EkfTrackingBank::compute_tracker_frequency_diffs().
+    fn update_channel(&mut self, chan: usize, sample: Complex<f32>) -> Option<(f64, f64)> {
         let sample_to_use = match self.modulation {
             Modulation::Bpsk => sample * sample,
             _ => sample,
         };
-        let theta_pred = self.x[0];
+        let idx = chan * 3;
+        let theta_pred = self.x[idx];
 
         let cos_theta = (-theta_pred).cos();
         let sin_theta = (-theta_pred).sin();
@@ -181,7 +223,6 @@ impl CarrierPllEkf {
 
         let amp = (sample_to_use.re as f64).hypot(sample_to_use.im as f64);
 
-        // Dynamic SNR-based measurement noise scaling & envelope check
         let alpha = 0.005;
         self.envelope_ema = (1.0 - alpha) * self.envelope_ema + alpha * amp;
 
@@ -214,6 +255,12 @@ impl CarrierPllEkf {
             }
         };
 
+        let (limit, half_limit) = match self.modulation {
+            Modulation::Carrier | Modulation::Bpsk => (2.0 * std::f64::consts::PI, std::f64::consts::PI),
+            Modulation::Qpsk => (std::f64::consts::PI / 2.0, std::f64::consts::PI / 4.0),
+        };
+        let z = (z + half_limit).rem_euclid(limit) - half_limit;
+
         // Folded components for Power Ratio
         let (i_n, q_n) = match self.modulation {
             Modulation::Carrier | Modulation::Bpsk => (derotated_re, derotated_im),
@@ -229,21 +276,76 @@ impl CarrierPllEkf {
         let abs_i = i_n.abs();
         let q_sq = q_n * q_n;
 
-        self.pr_sum_abs_i += abs_i;
-        self.pr_sum_q_sq += q_sq;
-        self.pr_window.push_back((abs_i, q_sq));
+        if chan == 0 {
+            self.pr_sum_abs_i += abs_i;
+            self.pr_sum_q_sq += q_sq;
+            self.pr_window.push_back((abs_i, q_sq));
 
-        if self.pr_window.len() > 1024
-            && let Some((old_abs_i, old_q_sq)) = self.pr_window.pop_front()
-        {
-            self.pr_sum_abs_i -= old_abs_i;
-            self.pr_sum_q_sq -= old_q_sq;
+            if self.pr_window.len() > 1024
+                && let Some((old_abs_i, old_q_sq)) = self.pr_window.pop_front()
+            {
+                self.pr_sum_abs_i -= old_abs_i;
+                self.pr_sum_q_sq -= old_q_sq;
+            }
+            if self.pr_sum_abs_i < 0.0 {
+                self.pr_sum_abs_i = 0.0;
+            }
+            if self.pr_sum_q_sq < 0.0 {
+                self.pr_sum_q_sq = 0.0;
+            }
         }
-        if self.pr_sum_abs_i < 0.0 {
-            self.pr_sum_abs_i = 0.0;
-        }
-        if self.pr_sum_q_sq < 0.0 {
-            self.pr_sum_q_sq = 0.0;
+
+        let s_val = self.p[(idx, idx)] + r_effective;
+        if s_val.abs() >= 1e-12 {
+            let mut k = [0.0; 6];
+            for r in 0..6 {
+                k[r] = self.p[(r, idx)] / s_val;
+            }
+            for r in 0..6 {
+                self.x[r] += k[r] * z;
+            }
+            self.x[idx] = (self.x[idx] + half_limit).rem_euclid(limit) - half_limit;
+
+            if self.x.iter().any(|v| v.is_nan()) {
+                self.x = Vector6::zeros();
+                self.p = Matrix6::zeros();
+                self.p[(0, 0)] = 1.0;
+                self.p[(1, 1)] = (2.0 * std::f64::consts::PI * 100.0).powi(2);
+                self.p[(2, 2)] = (2.0 * std::f64::consts::PI * 50.0).powi(2);
+                self.p[(3, 3)] = 1.0;
+                self.p[(4, 4)] = (2.0 * std::f64::consts::PI * 100.0).powi(2);
+                self.p[(5, 5)] = (2.0 * std::f64::consts::PI * 50.0).powi(2);
+                self.is_locked = false;
+                self.lock_metric = 0.0;
+                return None;
+            } else {
+                let max_freq = 2.0 * std::f64::consts::PI * 50000.0; // 50 kHz max
+                let max_chirp = 2.0 * std::f64::consts::PI * 1000.0;  // 1 kHz/s max
+                self.x[idx + 1] = self.x[idx + 1].clamp(-max_freq, max_freq);
+                self.x[idx + 2] = self.x[idx + 2].clamp(-max_chirp, max_chirp);
+
+                // Minimum covariance floor to prevent overconfidence.
+                for i in 0..6 {
+                    self.p[(i, i)] = self.p[(i, i)].max(1e-15);
+                }
+
+                // Manually unrolled Joseph form covariance update
+                // temp[r, c] = P[r, c] - k[r] * P[idx, c]
+                // P_new[r, c] = temp[r, c] - temp[r, idx] * k[c] + k[r] * k[c] * r_effective
+                let mut temp = [[0.0; 6]; 6];
+                for r in 0..6 {
+                    let kr = k[r];
+                    for c in 0..6 {
+                        temp[r][c] = self.p[(r, c)] - kr * self.p[(idx, c)];
+                    }
+                }
+                for r in 0..6 {
+                    let kr = k[r];
+                    for c in 0..6 {
+                        self.p[(r, c)] = temp[r][c] - temp[r][idx] * k[c] + kr * k[c] * r_effective;
+                    }
+                }
+            }
         }
 
         let pr = if self.pr_sum_q_sq > 1e-12 {
@@ -252,56 +354,42 @@ impl CarrierPllEkf {
             f64::MAX
         };
 
-        let h = RowVector3::new(1.0, 0.0, 0.0);
+        Some((norm_re, pr))
+    }
 
-        let s_val = (h * self.p * h.transpose())[(0, 0)] + r_effective;
-        if s_val.abs() < 1e-12 {
+    pub fn update(&mut self, sample: Complex<f32>) {
+        let Some((norm_re, pr)) = self.update_channel(0, sample) else {
             return;
-        }
-
-        let k = (self.p * h.transpose()) / s_val;
-
-        self.x += k * z;
-
-        let (limit, half_limit) = match self.modulation {
-            Modulation::Carrier | Modulation::Bpsk => (2.0 * std::f64::consts::PI, std::f64::consts::PI),
-            Modulation::Qpsk => (std::f64::consts::PI / 2.0, std::f64::consts::PI / 4.0),
         };
-        self.x[0] = (self.x[0] + half_limit).rem_euclid(limit) - half_limit;
-
-        // NaN guard: if any state element is NaN, reset the tracker to prevent
-        // permanent poisoning of the state vector.
-        if self.x.iter().any(|v| v.is_nan()) {
-            self.x = Vector3::zeros();
-            self.p = Matrix3::new(
-                1.0, 0.0, 0.0,
-                0.0, 1e6, 0.0,
-                0.0, 0.0, 1e4,
-            );
-            self.is_locked = false;
-            self.lock_metric = 0.0;
-            return;
-        }
-
-        // Frequency and chirp magnitude bounds to prevent divergence.
-        let max_freq = 2.0 * std::f64::consts::PI * 50000.0; // 50 kHz max
-        let max_chirp = 2.0 * std::f64::consts::PI * 1000.0;  // 1 kHz/s max
-        self.x[1] = self.x[1].clamp(-max_freq, max_freq);
-        self.x[2] = self.x[2].clamp(-max_chirp, max_chirp);
-
-        // Minimum covariance floor to prevent overconfidence.
-        for i in 0..3 {
-            self.p[(i, i)] = self.p[(i, i)].max(1e-15);
-        }
-
-        let i = Matrix3::identity();
-        let a = i - k * h;
-        let r_mat = Matrix1::new(r_effective);
-        self.p = a * self.p * a.transpose() + k * r_mat * k.transpose();
 
         let beta = 0.001;
         self.lock_metric = (1.0 - beta) * self.lock_metric + beta * norm_re;
         // Only check unlock thresholds after convergence grace period expires
+        if self.convergence_guard > 0 {
+            self.convergence_guard -= 1;
+        } else if self.is_locked {
+            if self.dual_lock {
+                if self.lock_metric < 0.02 {
+                    self.is_locked = false;
+                } else if self.lock_metric < 0.1 && pr <= 0.8 * 1024.0 {
+                    self.is_locked = false;
+                }
+            } else if self.lock_metric < 0.1 {
+                self.is_locked = false;
+            }
+        }
+    }
+
+    pub fn update_dual(&mut self, sample1: Complex<f32>, sample2: Complex<f32>) {
+        let Some((norm_re, pr)) = self.update_channel(0, sample1) else {
+            return;
+        };
+        if self.update_channel(1, sample2).is_none() {
+            return;
+        }
+
+        let beta = 0.001;
+        self.lock_metric = (1.0 - beta) * self.lock_metric + beta * norm_re;
         if self.convergence_guard > 0 {
             self.convergence_guard -= 1;
         } else if self.is_locked {
@@ -439,5 +527,20 @@ impl ChannelAllocator {
 
     pub fn active_count(&self) -> usize {
         self.active_channels.len()
+    }
+}
+
+pub struct AppletonHartreeDispersion;
+
+impl AppletonHartreeDispersion {
+    pub fn cancel(f1: f64, f2: f64, fd1: f64, fd2: f64) -> f64 {
+        let f1_sq = f1 * f1;
+        let f2_sq = f2 * f2;
+        let diff = f1_sq - f2_sq;
+        if diff.abs() < 1e-6 {
+            fd1
+        } else {
+            (f1_sq * fd1 - f2_sq * fd2) / diff
+        }
     }
 }
