@@ -32,7 +32,7 @@
 ## Build & Hardware Requirements
 
 ### Software Requirements
-- **Rust Toolchain**: Rust 1.85 or newer is required by the `edition = "2024"` setting in [Cargo.toml](Cargo.toml).
+- **Rust Toolchain**: Rust 1.89 or newer is required for the checked-in `Cargo.lock` dependency graph (`nalgebra` → `simba` → `wide 1.5.0`); [Cargo.toml](Cargo.toml) uses the 2024 edition.
 - **Operating System**: Linux or macOS. (Clock discipline features require `libc::adjtime`).
 - **Dependencies**:
   - `libusb` (for hardware SDR communication).
