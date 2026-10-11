@@ -2,7 +2,7 @@
 
 ![sattime TUI Screenshot](docs/sattime_screenshot.png)
 
-`sattime` is a high-performance, Rust-based Software Defined Radio (SDR) carrier-tracking receiver and satellite-disciplined time server daemon. Designed for Low Earth Orbit (LEO) satellite constellations (e.g., Starlink, NOAA, Orbcomm, Iridium), the system uses passive Doppler oscillometry to achieve relative positioning and millisecond-level local system clock synchronization—completely offline, without requiring a commercial internet connection.
+`sattime` is a high-performance, Rust-based Software Defined Radio (SDR) carrier-tracking receiver and satellite-disciplined time server daemon. Designed for Low Earth Orbit (LEO) satellite constellations (e.g., Starlink, NOAA, Orbcomm, Iridium), the system uses passive Doppler oscillometry to achieve relative positioning and millisecond-level local system clock synchronization—with local TLE files for offline operation. By default, the program attempts to download TLE data; use `--tle <local-file> --no-download-tle` to avoid that download.
 
 > [!NOTE]
 > **Real-World Testing & Hardware Setup**: During active development and live testing, the system consistently achieved signal locks and converged geodetic solutions using a highly accessible, indoor hardware setup: a simple **metal whip antenna magnetically mounted to a cookie sheet** (acting as a ground plane) sitting **inside a basement**, connected to a **HackRF One** SDR. This highlights the robustness of the 3-state carrier PLL-EKF and symbol tracking algorithms under heavily obstructed, non-ideal signal conditions.
@@ -32,7 +32,7 @@
 ## Build & Hardware Requirements
 
 ### Software Requirements
-- **Rust Toolchain**: Stable compiler (Rust 1.70+ recommended).
+- **Rust Toolchain**: Rust 1.89 or newer is required for the checked-in `Cargo.lock` dependency graph (`nalgebra` → `simba` → `wide 1.5.0`); [Cargo.toml](Cargo.toml) uses the 2024 edition.
 - **Operating System**: Linux or macOS. (Clock discipline features require `libc::adjtime`).
 - **Dependencies**:
   - `libusb` (for hardware SDR communication).
@@ -44,6 +44,14 @@
 - **Antenna**: A VHF/UHF antenna suitable for LEO reception. See the summary table below and the dedicated [Antenna Design & Tuning Guide](docs/antenna_tuning_guide.md) for detailed construction diagrams and physical calculations.
 
 ---
+
+To build from a checkout after installing the system dependencies above:
+
+```sh
+git clone https://github.com/steph4n-gh/sattime.git
+cd sattime
+cargo build --release
+```
 
 ## Antenna Tuning Guide
 
@@ -148,15 +156,17 @@ cargo run --release -- --sdr "driver=rtlsdr"
 ```
 
 ### 2. Simulation Mode
-Run a simulated satellite pass using a specific Two-Line Element (TLE) file, center frequency, and enable the LEODO clock steering loop:
+Generate a simulated satellite pass at the default center frequency. The program attempts to download a TLE file on first use; supply a local file with `--tle path/to/local.tle --no-download-tle` for offline use. Redirect stdout because simulation writes raw interleaved signed 8-bit I/Q samples, not terminal text:
 ```bash
-cargo run --release -- --simulate --tle passes/starlink.tle --frequency 150800000.0 --leodo
+cargo run --release -- --simulate --frequency 150800000.0 > simulated-pass.iq
 ```
 
+At the default 2 MHz sample rate, the 90-second simulation writes about 360 MB to this file. It generates samples and returns; it does not run receiver tracking or clock discipline. In live tracking modes, `--leodo` enables host clock steering, so use it only when you intend to adjust the system clock. `--leodo-shm` selects the NTP shared-memory path instead.
+
 ### 3. Orbit Solver Mode
-Determine circular orbital parameters ($a, i, \Omega_0, u_0$) and pass-specific clock offsets from raw frequency measurement logs:
+Determine circular orbital parameters ($a, i, \Omega_0, u_0$) and pass-specific clock offsets from your own raw frequency measurement logs. The example CSV files are not included in this repository:
 ```bash
-cargo run --release -- --solve-orbit passes/pass_1.csv,passes/pass_2.csv
+cargo run --release -- --solve-orbit path/to/pass_1.csv,path/to/pass_2.csv
 ```
 
 ### 4. Dual-Frequency Live Mode
@@ -203,6 +213,6 @@ When running the visual dashboard, use the following interactive hotkeys:
   - `docs/conceptual_guide.md`: Accessible, analogy-driven explanations of the core tracking and signal processing algorithms.
   - `docs/technical_reference.md`: Rigorous mathematical formulations, physical equations, and RF engineering specifications.
 - **`tests/`**: Unit, integration, and stress test suites.
-- **`passes/`**: Reference TLE and pass recording CSV files.
+- **`passes/`**: Runtime TLE cache and pass recordings. This directory is not checked in; provide your own pass CSV files for `--solve-orbit`.
 
 For deeper insights, please read the [Conceptual Guide](docs/conceptual_guide.md) and the [Technical Reference](docs/technical_reference.md).
